@@ -1,0 +1,8 @@
+venv
+.env
+.config
+credentials.json
+token.pickle
+models
+piper
+__pycache__
