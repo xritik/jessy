@@ -1,32 +1,44 @@
 """
 JESSY Backend — Entry Point
-Step 1: Foundation server.
 
-This file will grow as we add the agent, capabilities, voice,
-and websocket layers in later steps. For now it exposes a health
-endpoint so the frontend can verify a real connection exists.
+Step 2: Wires the Core Agent (Groq client, Capability Registry,
+Executor, Agent loop) into a real /chat endpoint.
 """
 
+import logging
 import os
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# Load environment variables from backend/.env
+# Load environment variables from backend/.env before anything else
+# that depends on them (GroqClient, MAX_AGENT_STEPS, etc.) is created.
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("jessy.main")
+
+# Importing capabilities registers them into the shared registry.
+import capabilities  # noqa: E402,F401
+from core.executor import Executor  # noqa: E402
+from core.groq_client import get_groq_client  # noqa: E402
+from core.registry import registry  # noqa: E402
+from agent.agent import Agent  # noqa: E402
 
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
 
 app = FastAPI(
     title="JESSY Backend",
     description="AI Personal Computer Agent — Backend API",
-    version="0.1.0",
+    version="0.2.0",
 )
 
-# Allow the React dev server to call this API during development.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[FRONTEND_ORIGIN],
@@ -35,6 +47,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+executor = Executor(registry)
+
 
 class HealthResponse(BaseModel):
     status: str
@@ -42,23 +56,46 @@ class HealthResponse(BaseModel):
     timestamp: str
 
 
+class ChatRequest(BaseModel):
+    message: str
+
+
+class ChatResponse(BaseModel):
+    response: str
+    steps: int
+
+
 @app.get("/", tags=["root"])
 async def root():
-    """Basic root route to confirm the server is alive."""
     return {"message": "JESSY backend is running."}
 
 
 @app.get("/health", response_model=HealthResponse, tags=["health"])
 async def health_check():
-    """
-    Reports that the backend process is alive and reachable.
-
-    This is intentionally simple in Step 1 — it does not yet report
-    on Groq, Whisper, TTS, or capability subsystems. Those checks
-    are added in later phases as those subsystems are built.
-    """
     return HealthResponse(
         status="online",
         service="jessy-backend",
         timestamp=datetime.now(timezone.utc).isoformat(),
     )
+
+
+@app.post("/chat", response_model=ChatResponse, tags=["agent"])
+async def chat(request: ChatRequest):
+    """
+    Send a message to the JESSY agent and get back its final response
+    after it has run its full tool-calling loop.
+    """
+    try:
+        groq_client = get_groq_client()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    agent = Agent(groq_client=groq_client, registry=registry, executor=executor)
+
+    try:
+        final_text, step_logs = agent.run(user_message=request.message)
+    except Exception as exc:
+        logger.exception("Agent run failed")
+        raise HTTPException(status_code=500, detail=f"Agent error: {exc}") from exc
+
+    return ChatResponse(response=final_text, steps=len(step_logs))
