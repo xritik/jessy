@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 
 from capabilities.guard import is_protected_path
 from core.registry import registry
@@ -170,6 +171,27 @@ def copy_path(source: str, destination: str) -> CapabilityResult:
     return CapabilityResult.ok("copy_path", {"source": src, "destination": dst})
 
 
+def open_folder(path: str = "~") -> CapabilityResult:
+    """Open a folder directly in File Explorer using explorer.exe on its
+    real filesystem path. Never route this through os.startfile with a
+    file:// URI or through a browser opener — Windows resolves the
+    file:// scheme via the OS's default *browser* handler (Edge/Chrome),
+    not File Explorer, which is exactly what this avoids."""
+    resolved = _resolve(path)
+
+    if not os.path.exists(resolved):
+        return CapabilityResult.fail("open_folder", f"Path does not exist: {resolved}")
+    if not os.path.isdir(resolved):
+        return CapabilityResult.fail("open_folder", f"Path is not a directory: {resolved}")
+
+    try:
+        subprocess.Popen(["explorer.exe", resolved])
+    except OSError as exc:
+        return CapabilityResult.fail("open_folder", f"Failed to open folder: {exc}")
+
+    return CapabilityResult.ok("open_folder", {"path": resolved})
+
+
 registry.register(
     name="list_directory",
     function=list_directory,
@@ -270,6 +292,27 @@ registry.register(
             "destination": {"type": "string", "description": "Path to copy it to."},
         },
         "required": ["source", "destination"],
+    },
+    risk="safe",
+)
+
+registry.register(
+    name="open_folder",
+    function=open_folder,
+    description=(
+        "Open a folder directly in File Explorer by its real filesystem "
+        "path (e.g. 'C:\\Users\\me\\Desktop\\jessy', or shortcuts like "
+        "'~', 'Desktop'). Use this for ANY request to open File Explorer "
+        "or a specific folder — never use open_url for folders, since "
+        "file:// URIs get hijacked by the default browser instead of "
+        "opening Explorer. Defaults to the home folder if no path is given."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Folder path to open. Defaults to the home directory ('~')."},
+        },
+        "required": [],
     },
     risk="safe",
 )

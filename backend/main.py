@@ -13,9 +13,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from core.memory import get_history, append_message
 
-# Load environment variables from backend/.env before anything else
-# that depends on them (GroqClient, MAX_AGENT_STEPS, etc.) is created.
 load_dotenv()
 
 logging.basicConfig(
@@ -24,7 +23,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("jessy.main")
 
-# Importing capabilities registers them into the shared registry.
 import capabilities  # noqa: E402,F401
 from core.executor import Executor  # noqa: E402
 from core.groq_client import get_groq_client  # noqa: E402
@@ -58,6 +56,7 @@ class HealthResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
+    session_id: str | None = "default"
 
 
 class ChatResponse(BaseModel):
@@ -79,6 +78,23 @@ async def health_check():
     )
 
 
+# --- TEMPORARY DEBUG ROUTE — remove once the spawn issue is diagnosed ---
+@app.get("/debug/spawn-test", tags=["debug"])
+def debug_spawn_test():
+    import subprocess
+    import getpass
+    import os as _os
+
+    proc = subprocess.Popen(["cmd.exe"])
+    return {
+        "status": "launched",
+        "pid": proc.pid,
+        "running_as_user": getpass.getuser(),
+        "session_name": _os.environ.get("SESSIONNAME"),
+    }
+# -------------------------------------------------------------------------
+
+
 @app.post("/chat", response_model=ChatResponse, tags=["agent"])
 async def chat(request: ChatRequest):
     """
@@ -92,10 +108,16 @@ async def chat(request: ChatRequest):
 
     agent = Agent(groq_client=groq_client, registry=registry, executor=executor)
 
+    session_id = request.session_id or "default"
+    history = get_history(session_id)
+
     try:
-        final_text, step_logs = agent.run(user_message=request.message)
+        final_text, step_logs = agent.run(user_message=request.message, history=history)
     except Exception as exc:
         logger.exception("Agent run failed")
         raise HTTPException(status_code=500, detail=f"Agent error: {exc}") from exc
+
+    append_message(session_id, "user", request.message)
+    append_message(session_id, "assistant", final_text)
 
     return ChatResponse(response=final_text, steps=len(step_logs))
