@@ -1,11 +1,11 @@
 """
 JESSY Capabilities Package.
 
-Each module here defines real, local implementations of actions JESSY
-can take, and registers them into the shared capability registry.
-
-This __init__ imports every capability module so that simply importing
-`capabilities` registers everything, keeping main.py clean.
+Importing this package registers every capability module into the
+shared registry, keeping main.py clean.
 """
 
-from capabilities import system  # noqa: F401
+from capabilities import system      # noqa: F401
+from capabilities import filesystem  # noqa: F401
+from capabilities import windows     # noqa: F401
+from capabilities import process     # noqa: F401

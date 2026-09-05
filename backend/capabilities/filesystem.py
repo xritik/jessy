@@ -1,0 +1,275 @@
+"""
+Filesystem capabilities.
+
+Paths accept "~", environment variables, and relative paths, and are
+resolved to absolute paths before use. Destructive operations (delete,
+move, overwrite) are tagged risk="confirm" for the future Safety Layer.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+
+from capabilities.guard import is_protected_path
+from core.registry import registry
+from core.result import CapabilityResult
+
+
+def _resolve(path: str) -> str:
+    return os.path.abspath(os.path.expanduser(os.path.expandvars(path)))
+
+
+def list_directory(path: str = ".") -> CapabilityResult:
+    """List files and folders inside the given directory."""
+    resolved = _resolve(path)
+
+    if not os.path.exists(resolved):
+        return CapabilityResult.fail("list_directory", f"Path does not exist: {resolved}")
+    if not os.path.isdir(resolved):
+        return CapabilityResult.fail("list_directory", f"Path is not a directory: {resolved}")
+
+    entries = []
+    with os.scandir(resolved) as it:
+        for entry in it:
+            try:
+                stat = entry.stat()
+                entries.append({
+                    "name": entry.name,
+                    "type": "directory" if entry.is_dir() else "file",
+                    "size_bytes": stat.st_size if entry.is_file() else None,
+                })
+            except OSError:
+                continue
+
+    return CapabilityResult.ok("list_directory", {"path": resolved, "entries": entries})
+
+
+def read_file(path: str, max_chars: int = 5000) -> CapabilityResult:
+    """Read the text contents of a file, truncated to max_chars."""
+    resolved = _resolve(path)
+
+    if not os.path.exists(resolved):
+        return CapabilityResult.fail("read_file", f"File does not exist: {resolved}")
+    if not os.path.isfile(resolved):
+        return CapabilityResult.fail("read_file", f"Path is not a file: {resolved}")
+
+    try:
+        with open(resolved, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read(max_chars + 1)
+    except PermissionError:
+        return CapabilityResult.fail("read_file", f"Permission denied: {resolved}")
+
+    truncated = len(content) > max_chars
+    return CapabilityResult.ok("read_file", {
+        "path": resolved,
+        "content": content[:max_chars],
+        "truncated": truncated,
+    })
+
+
+def write_file(path: str, content: str, overwrite: bool = False) -> CapabilityResult:
+    """Create a new file with the given content. Fails if it exists unless overwrite=True."""
+    resolved = _resolve(path)
+
+    if is_protected_path(os.path.dirname(resolved) or resolved):
+        return CapabilityResult.fail("write_file", f"Refusing to write into protected system path: {resolved}")
+
+    if os.path.exists(resolved) and not overwrite:
+        return CapabilityResult.fail("write_file", f"File already exists (set overwrite=true to replace it): {resolved}")
+
+    try:
+        os.makedirs(os.path.dirname(resolved), exist_ok=True)
+        with open(resolved, "w", encoding="utf-8") as f:
+            f.write(content)
+    except PermissionError:
+        return CapabilityResult.fail("write_file", f"Permission denied: {resolved}")
+
+    return CapabilityResult.ok("write_file", {"path": resolved, "bytes_written": len(content.encode("utf-8"))})
+
+
+def create_directory(path: str) -> CapabilityResult:
+    """Create a directory, including any missing parent directories."""
+    resolved = _resolve(path)
+
+    if is_protected_path(resolved):
+        return CapabilityResult.fail("create_directory", f"Refusing to create inside protected system path: {resolved}")
+
+    try:
+        os.makedirs(resolved, exist_ok=True)
+    except PermissionError:
+        return CapabilityResult.fail("create_directory", f"Permission denied: {resolved}")
+
+    return CapabilityResult.ok("create_directory", {"path": resolved})
+
+
+def delete_path(path: str, recursive: bool = False) -> CapabilityResult:
+    """Delete a file, or a directory tree if recursive=True."""
+    resolved = _resolve(path)
+
+    if is_protected_path(resolved):
+        return CapabilityResult.fail("delete_path", f"Refusing to delete protected system path: {resolved}")
+    if not os.path.exists(resolved):
+        return CapabilityResult.fail("delete_path", f"Path does not exist: {resolved}")
+
+    try:
+        if os.path.isdir(resolved):
+            if not recursive:
+                return CapabilityResult.fail(
+                    "delete_path",
+                    f"'{resolved}' is a directory. Set recursive=true to delete it and its contents.",
+                )
+            shutil.rmtree(resolved)
+        else:
+            os.remove(resolved)
+    except PermissionError:
+        return CapabilityResult.fail("delete_path", f"Permission denied: {resolved}")
+
+    return CapabilityResult.ok("delete_path", {"path": resolved, "deleted": True})
+
+
+def move_path(source: str, destination: str) -> CapabilityResult:
+    """Move or rename a file or directory."""
+    src = _resolve(source)
+    dst = _resolve(destination)
+
+    if is_protected_path(src) or is_protected_path(dst):
+        return CapabilityResult.fail("move_path", "Refusing to move a protected system path.")
+    if not os.path.exists(src):
+        return CapabilityResult.fail("move_path", f"Source does not exist: {src}")
+
+    try:
+        shutil.move(src, dst)
+    except PermissionError:
+        return CapabilityResult.fail("move_path", "Permission denied during move.")
+    except shutil.Error as exc:
+        return CapabilityResult.fail("move_path", str(exc))
+
+    return CapabilityResult.ok("move_path", {"source": src, "destination": dst})
+
+
+def copy_path(source: str, destination: str) -> CapabilityResult:
+    """Copy a file or directory to a new location, leaving the original intact."""
+    src = _resolve(source)
+    dst = _resolve(destination)
+
+    if not os.path.exists(src):
+        return CapabilityResult.fail("copy_path", f"Source does not exist: {src}")
+
+    try:
+        if os.path.isdir(src):
+            shutil.copytree(src, dst)
+        else:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+    except PermissionError:
+        return CapabilityResult.fail("copy_path", "Permission denied during copy.")
+    except shutil.Error as exc:
+        return CapabilityResult.fail("copy_path", str(exc))
+
+    return CapabilityResult.ok("copy_path", {"source": src, "destination": dst})
+
+
+registry.register(
+    name="list_directory",
+    function=list_directory,
+    description="List the files and subfolders inside a given directory path.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Directory path to list. Defaults to the current directory."},
+        },
+        "required": [],
+    },
+    risk="safe",
+)
+
+registry.register(
+    name="read_file",
+    function=read_file,
+    description="Read and return the text contents of a file.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path to the file to read."},
+            "max_chars": {"type": "integer", "description": "Maximum characters to return. Defaults to 5000."},
+        },
+        "required": ["path"],
+    },
+    risk="safe",
+)
+
+registry.register(
+    name="write_file",
+    function=write_file,
+    description="Create a new text file with the given content, or overwrite an existing one if overwrite=true.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path of the file to write."},
+            "content": {"type": "string", "description": "Text content to write into the file."},
+            "overwrite": {"type": "boolean", "description": "Whether to overwrite if the file already exists. Defaults to false."},
+        },
+        "required": ["path", "content"],
+    },
+    risk="confirm",
+)
+
+registry.register(
+    name="create_directory",
+    function=create_directory,
+    description="Create a new folder, including any missing parent folders.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path of the directory to create."},
+        },
+        "required": ["path"],
+    },
+    risk="safe",
+)
+
+registry.register(
+    name="delete_path",
+    function=delete_path,
+    description="Delete a file, or a directory and all its contents if recursive=true. This cannot be undone.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path of the file or directory to delete."},
+            "recursive": {"type": "boolean", "description": "Required to be true to delete a non-empty directory."},
+        },
+        "required": ["path"],
+    },
+    risk="confirm",
+)
+
+registry.register(
+    name="move_path",
+    function=move_path,
+    description="Move or rename a file or directory to a new location.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "source": {"type": "string", "description": "Current path of the file or directory."},
+            "destination": {"type": "string", "description": "New path or new name."},
+        },
+        "required": ["source", "destination"],
+    },
+    risk="confirm",
+)
+
+registry.register(
+    name="copy_path",
+    function=copy_path,
+    description="Copy a file or directory to a new location, leaving the original in place.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "source": {"type": "string", "description": "Path of the file or directory to copy."},
+            "destination": {"type": "string", "description": "Path to copy it to."},
+        },
+        "required": ["source", "destination"],
+    },
+    risk="safe",
+)
