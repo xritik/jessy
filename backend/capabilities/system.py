@@ -7,12 +7,26 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
-from datetime import datetime, timezone
-
+import comtypes
+import traceback
+import wmi
 import psutil
 
+
+from datetime import datetime, timezone
+from ctypes import cast, POINTER
+from comtypes import CLSCTX_ALL
+from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 from core.registry import registry
 from core.result import CapabilityResult
+
+DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jessy_debug.log")
+
+def _log_error(label: str):
+    with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(f"\n--- {label} ---\n")
+        f.write(traceback.format_exc())
+        f.write("\n")
 
 
 def get_current_time() -> dict:
@@ -270,8 +284,91 @@ Await ($bt.SetStateAsync('{state}')) ([Windows.Devices.Radios.RadioAccessStatus]
     except OSError:
         pass
 
-
     return CapabilityResult.ok("set_bluetooth_power", {"bluetooth": action})
+
+
+def _get_volume_interface():
+    try:
+        comtypes.CoInitialize()
+    except OSError:
+        pass  # already initialized on this thread — safe to ignore
+
+    devices = AudioUtilities.GetSpeakers()
+    return devices.EndpointVolume.QueryInterface(IAudioEndpointVolume)
+
+
+def set_system_volume(level: int) -> CapabilityResult:
+    """Set system volume to a specific percentage (0-100)."""
+    if not isinstance(level, int) or not (0 <= level <= 100):
+        return CapabilityResult.fail("set_system_volume", "Volume level must be an integer between 0 and 100.")
+
+    try:
+        volume = _get_volume_interface()
+        volume.SetMasterVolumeLevelScalar(level / 100.0, None)
+    except Exception:
+        _log_error("VOLUME SET FAILED")
+        return CapabilityResult.fail("set_system_volume", "Failed to set volume.")
+
+    return CapabilityResult.ok("set_system_volume", {"volume": level})
+
+
+def get_system_volume() -> CapabilityResult:
+    """Get the current system volume percentage."""
+    with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write("get_system_volume() was called\n")
+
+    try:
+        volume = _get_volume_interface()
+        level = round(volume.GetMasterVolumeLevelScalar() * 100)
+    except Exception:
+        _log_error("VOLUME READ FAILED")
+        return CapabilityResult.fail("get_system_volume", "Failed to read volume.")
+
+    return CapabilityResult.ok("get_system_volume", {"volume": level})
+
+
+def mute_system_volume(mute: bool) -> CapabilityResult:
+    """Mute or unmute system audio."""
+    try:
+        volume = _get_volume_interface()
+        volume.SetMute(1 if mute else 0, None)
+    except Exception:
+        _log_error("VOLUME MUTE FAILED")
+        return CapabilityResult.fail("mute_system_volume", "Failed to change mute state.")
+
+    return CapabilityResult.ok("mute_system_volume", {"muted": mute})
+
+
+def _get_brightness_interface():
+    c = wmi.WMI(namespace="wmi")
+    return c.WmiMonitorBrightnessMethods()[0]
+
+
+def get_system_brightness() -> CapabilityResult:
+    """Get the current screen brightness percentage."""
+    try:
+        c = wmi.WMI(namespace="wmi")
+        level = c.WmiMonitorBrightness()[0].CurrentBrightness
+    except Exception:
+        _log_error("BRIGHTNESS READ FAILED")
+        return CapabilityResult.fail("get_system_brightness", "Failed to read brightness.")
+
+    return CapabilityResult.ok("get_system_brightness", {"brightness": level})
+
+
+def set_system_brightness(level: int) -> CapabilityResult:
+    """Set screen brightness to a specific percentage (0-100)."""
+    if not isinstance(level, int) or not (0 <= level <= 100):
+        return CapabilityResult.fail("set_system_brightness", "Brightness level must be an integer between 0 and 100.")
+
+    try:
+        brightness_methods = _get_brightness_interface()
+        brightness_methods.WmiSetBrightness(level, 0)
+    except Exception:
+        _log_error("BRIGHTNESS SET FAILED")
+        return CapabilityResult.fail("set_system_brightness", "Failed to set brightness.")
+
+    return CapabilityResult.ok("set_system_brightness", {"brightness": level})
 
 
 registry.register(
@@ -377,4 +474,62 @@ registry.register(
         "required": ["action"],
     },
     risk="moderate",
+)
+
+registry.register(
+    name="set_system_volume",
+    function=set_system_volume,
+    description="Set the system volume to a specific percentage (0-100).",
+    parameters={
+        "type": "object",
+        "properties": {
+            "level": {"type": "integer", "minimum": 0, "maximum": 100, "description": "Target volume percentage"},
+        },
+        "required": ["level"],
+    },
+    risk="low",
+)
+
+registry.register(
+    name="get_system_volume",
+    function=get_system_volume,
+    description="Get the current system volume percentage.",
+    parameters={"type": "object", "properties": {}, "required": []},
+    risk="low",
+)
+
+registry.register(
+    name="mute_system_volume",
+    function=mute_system_volume,
+    description="Mute or unmute system audio.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "mute": {"type": "boolean", "description": "True to mute, False to unmute"},
+        },
+        "required": ["mute"],
+    },
+    risk="low",
+)
+
+registry.register(
+    name="get_system_brightness",
+    function=get_system_brightness,
+    description="Get the current screen brightness percentage.",
+    parameters={"type": "object", "properties": {}, "required": []},
+    risk="safe",
+)
+
+registry.register(
+    name="set_system_brightness",
+    function=set_system_brightness,
+    description="Set the screen brightness to a specific percentage (0-100).",
+    parameters={
+        "type": "object",
+        "properties": {
+            "level": {"type": "integer", "minimum": 0, "maximum": 100, "description": "Target brightness percentage"},
+        },
+        "required": ["level"],
+    },
+    risk="low",
 )
