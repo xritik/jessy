@@ -1,6 +1,7 @@
 """
 Browser capabilities: opening URLs with real control over tab vs window,
-listing what's open, and closing a specific tab without touching others.
+listing what's open, closing a specific tab without touching others, and
+playing a YouTube video directly (not just opening a search page).
 
 Windows' webbrowser module ignores the 'new window vs new tab' flag
 entirely (it just calls os.startfile). To actually control this, we
@@ -16,6 +17,12 @@ to get the actual URL for reliable matching.
 Tabs are read from the window's TabControl container directly (not a
 full recursive tree walk) so that background/non-active tabs are found
 too, instead of only ever surfacing the currently active tab.
+
+play_youtube resolves a search query to a real video ID by scraping
+YouTube's search results HTML for the first "videoId" occurrence (no API
+key required), then opens that video's watch URL with autoplay=1 — this
+is what makes it actually PLAY something instead of just opening a
+search results listing.
 """
 
 from __future__ import annotations
@@ -26,6 +33,8 @@ import os
 import re
 import subprocess
 import time
+import urllib.parse
+import urllib.request
 
 import uiautomation as auto
 
@@ -93,16 +102,163 @@ registry.register(
         "running instance (or launches it if not running); with "
         "new_window=true it forces a genuinely separate new window. If no "
         "browser is named, it opens in the OS default browser. Do NOT use "
-        "this for local folders/files — use open_folder instead."
+        "this for local folders/files — use open_folder instead. Do NOT "
+        "use this to play a song/video on YouTube — use play_youtube "
+        "instead, since this only opens a page/search results, it never "
+        "plays anything."
     ),
     parameters={
         "type": "object",
         "properties": {
             "url": {"type": "string", "description": "URL or site to open, e.g. 'google.com'."},
-            "browser": {"type": "string", "description": "Specific browser to use: 'chrome' or 'edge'. Omit if unspecified."},
-            "new_window": {"type": "boolean", "description": "Force a new separate window instead of a new tab. Defaults to false."},
+            "browser": {
+                "type": ["string", "null"],
+                "description": "Specific browser to use: 'chrome' or 'edge'. Omit or pass null if unspecified.",
+            },
+            "new_window": {
+                "type": ["boolean", "null"],
+                "description": "Force a new separate window instead of a new tab. Defaults to false; pass null if unspecified.",
+            },
         },
         "required": ["url"],
+    },
+    risk="safe",
+)
+
+
+# ---------------------------------------------------------------------------
+# YouTube: resolve a query to a real video and play it, not just search.
+# ---------------------------------------------------------------------------
+
+_YOUTUBE_SEARCH_URL = "https://www.youtube.com/results"
+_YOUTUBE_WATCH_URL = "https://www.youtube.com/watch"
+
+
+def _fetch_first_youtube_video_id(query: str) -> str | None:
+    """Resolve a query to a video ID via the YouTube Data API v3 search
+    endpoint. This returns a tiny JSON response (a few KB) in well under
+    a second, unlike scraping the full HTML search page — which is
+    multi-hundred-KB, chunked, and can take 20-30+ seconds depending on
+    network conditions."""
+    api_key = os.environ.get("YOUTUBE_API_KEY")
+    if not api_key:
+        logger.warning("YOUTUBE_API_KEY not set; falling back to slow HTML scrape.")
+        return _fetch_first_youtube_video_id_via_scrape(query)
+
+    params = urllib.parse.urlencode({
+        "part": "snippet",
+        "type": "video",
+        "maxResults": 1,
+        "q": query,
+        "key": api_key,
+    })
+    url = f"https://www.googleapis.com/youtube/v3/search?{params}"
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            import json
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        logger.exception("YouTube Data API search failed for '%s'; falling back to scrape.", query)
+        return _fetch_first_youtube_video_id_via_scrape(query)
+
+    items = data.get("items") or []
+    if not items:
+        return None
+    return items[0].get("id", {}).get("videoId")
+
+
+def _fetch_first_youtube_video_id_via_scrape(query: str) -> str | None:
+    """Fallback only: scrape YouTube's search results HTML for the first
+    video ID when no API key is configured or the API call fails. This
+    path is slower and less reliable — prefer setting YOUTUBE_API_KEY."""
+    params = urllib.parse.urlencode({"search_query": query})
+    url = f"{_YOUTUBE_SEARCH_URL}?{params}"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip"},
+    )
+
+    pattern = re.compile(rb'"videoId":"([A-Za-z0-9_-]{11})"')
+    max_bytes = 1_000_000
+    chunk_size = 65_536
+
+    try:
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            import gzip
+            raw = b""
+            total = 0
+            while total < max_bytes:
+                chunk = resp.read(chunk_size)
+                if not chunk:
+                    break
+                raw += chunk
+                total += len(chunk)
+                if resp.headers.get("Content-Encoding") == "gzip":
+                    try:
+                        decompressed = gzip.decompress(raw)
+                    except OSError:
+                        continue  # not enough data yet to decompress fully
+                else:
+                    decompressed = raw
+                match = pattern.search(decompressed)
+                if match:
+                    return match.group(1).decode()
+    except Exception:
+        logger.exception("Fallback scrape failed for '%s'", query)
+        return None
+
+    return None
+
+
+
+
+def play_youtube(query: str, browser: str | None = None, new_window: bool = False) -> CapabilityResult:
+    t0 = time.monotonic()
+    query = query.strip()
+    if not query:
+        return CapabilityResult.fail("play_youtube", "No song/video name was given to search for.")
+
+    video_id = _fetch_first_youtube_video_id(query)
+    t1 = time.monotonic()
+    logger.info("play_youtube: fetch took %.2fs, video_id=%s", t1 - t0, video_id)
+
+    if video_id is None:
+        search_url = f"{_YOUTUBE_SEARCH_URL}?{urllib.parse.urlencode({'search_query': query})}"
+        return open_url(search_url, browser=browser, new_window=new_window)
+
+    watch_url = f"{_YOUTUBE_WATCH_URL}?{urllib.parse.urlencode({'v': video_id, 'autoplay': '1'})}"
+    result = open_url(watch_url, browser=browser, new_window=new_window)
+    t2 = time.monotonic()
+    logger.info("play_youtube: open_url took %.2fs", t2 - t1)
+    return result
+
+
+registry.register(
+    name="play_youtube",
+    function=play_youtube,
+    description=(
+        "Search YouTube for a song, video, or artist and PLAY the top "
+        "matching video directly by opening its watch page with autoplay — "
+        "not just a search results listing. Use this whenever the user "
+        "asks to 'play <song/video> on YouTube' or 'play <artist> on "
+        "YouTube'. Do not use open_url for this."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Song, video, or artist name to search for and play."},
+            "browser": {
+                "type": ["string", "null"],
+                "description": "Specific browser to use: 'chrome' or 'edge'. Omit or pass null if unspecified.",
+            },
+            "new_window": {
+                "type": ["boolean", "null"],
+                "description": "Force a new separate window instead of a new tab. Defaults to false; pass null if unspecified.",
+            },
+        },
+        "required": ["query"],
     },
     risk="safe",
 )
