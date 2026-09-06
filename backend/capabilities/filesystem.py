@@ -9,6 +9,7 @@ move, overwrite) are tagged risk="confirm" for the future Safety Layer.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 
@@ -171,6 +172,79 @@ def copy_path(source: str, destination: str) -> CapabilityResult:
     return CapabilityResult.ok("copy_path", {"source": src, "destination": dst})
 
 
+_SEARCH_ROOTS = ["~", "~/Desktop", "~/Documents", "~/Downloads", "~/Pictures", "~/Videos", "~/Music", "~/OneDrive"]
+_SKIP_DIR_NAMES = {"node_modules", "__pycache__", ".git", "AppData", "$Recycle.Bin", ".venv", "venv"}
+
+
+def _normalize(s: str) -> str:
+    """Collapse -, _, and whitespace into single spaces for loose comparison,
+    so 'home_services', 'home-services', and 'home services' all match."""
+    return re.sub(r"[\s\-_]+", " ", s.strip().lower())
+
+
+def _is_match(query_norm: str, query_tokens: set[str], candidate_name: str) -> bool:
+    """True if candidate_name matches the query either as a substring
+    (ignoring separator style) or by containing all query words/tokens
+    regardless of order."""
+    name_norm = _normalize(candidate_name)
+    if query_norm and query_norm in name_norm:
+        return True
+    name_tokens = set(name_norm.split())
+    return bool(query_tokens) and query_tokens.issubset(name_tokens)
+
+
+def find_path(name: str, type: str = "any", max_results: int = 5) -> CapabilityResult:
+    """Search common user locations (home, Desktop, Documents, Downloads,
+    Pictures, Videos, Music, OneDrive) for a file or folder whose name
+    matches the given text. Matching ignores differences in separators
+    (-, _, space) and word order, so the caller doesn't need to know the
+    exact spelling or path. Use this whenever the user refers to a file or
+    folder by name without giving its full location."""
+    query_norm = _normalize(name)
+    query_tokens = set(query_norm.split())
+    if not query_norm:
+        return CapabilityResult.fail("find_path", "No search term given.")
+
+    matches: list[dict] = []
+    visited_roots: set[str] = set()
+
+    for root in _SEARCH_ROOTS:
+        resolved_root = _resolve(root)
+        if resolved_root in visited_roots or not os.path.isdir(resolved_root):
+            continue
+        visited_roots.add(resolved_root)
+
+        for dirpath, dirnames, filenames in os.walk(resolved_root):
+            depth = dirpath[len(resolved_root):].count(os.sep)
+            if depth >= 4:
+                dirnames[:] = []
+                continue
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIR_NAMES and not d.startswith(".")]
+
+            if type in ("any", "directory"):
+                for d in dirnames:
+                    if _is_match(query_norm, query_tokens, d):
+                        matches.append({"path": os.path.join(dirpath, d), "type": "directory"})
+            if type in ("any", "file"):
+                for f in filenames:
+                    if _is_match(query_norm, query_tokens, f):
+                        matches.append({"path": os.path.join(dirpath, f), "type": "file"})
+
+            if len(matches) >= max_results:
+                break
+        if len(matches) >= max_results:
+            break
+
+    if not matches:
+        return CapabilityResult.fail(
+            "find_path",
+            f"No file or folder matching '{name}' found in common locations "
+            "(home, Desktop, Documents, Downloads, Pictures, Videos, Music, OneDrive).",
+        )
+
+    return CapabilityResult.ok("find_path", {"query": name, "matches": matches[:max_results]})
+
+
 def open_folder(path: str = "~") -> CapabilityResult:
     """Open a folder directly in File Explorer using explorer.exe on its
     real filesystem path. Never route this through os.startfile with a
@@ -202,6 +276,36 @@ registry.register(
             "path": {"type": "string", "description": "Directory path to list. Defaults to the current directory."},
         },
         "required": [],
+    },
+    risk="safe",
+)
+
+registry.register(
+    name="find_path",
+    function=find_path,
+    description=(
+        "Search common user locations (home, Desktop, Documents, "
+        "Downloads, Pictures, Videos, Music, OneDrive) for a FILE OR "
+        "FOLDER by name, when the exact path is unknown. Matching ignores "
+        "differences in separators (-, _, space) and word order, so pass "
+        "the name as the user said it — do NOT try multiple separator "
+        "variants yourself, one call is enough. Use this instead of asking "
+        "the user for a path whenever they reference something by name "
+        "only, e.g. 'open the jessy folder' or 'find my resume'. Returns "
+        "one or more matching paths with their type ('file' or 'directory')."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "Name or partial name to search for."},
+            "type": {
+                "type": "string",
+                "enum": ["any", "file", "directory"],
+                "description": "Restrict results to files only, folders only, or any. Defaults to 'any'.",
+            },
+            "max_results": {"type": "integer", "description": "Maximum number of matches to return. Defaults to 5."},
+        },
+        "required": ["name"],
     },
     risk="safe",
 )

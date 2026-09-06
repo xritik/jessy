@@ -36,7 +36,12 @@ FRIENDLY_APPS = {
     "microsoft excel": "excel.exe",
     "powerpoint": "powerpnt.exe",
     "microsoft powerpoint": "powerpnt.exe",
+    "vscode": "code.cmd",
+    "vs code": "code.cmd",
+    "visual studio code": "code.cmd",
+    "code": "code.cmd",
 }
+
 
 PROTOCOL_APPS = {
     "settings": "ms-settings:",

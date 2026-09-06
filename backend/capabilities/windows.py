@@ -22,8 +22,16 @@ from core.registry import registry
 from core.result import CapabilityResult
 
 
-def open_application(name: str) -> CapabilityResult:
-    """Launch a Windows application by friendly name, executable name, or full path."""
+def _resolve_target_path(path: str) -> str:
+    return os.path.abspath(os.path.expanduser(os.path.expandvars(path)))
+
+
+def open_application(name: str, path: str | None = None) -> CapabilityResult:
+    """Launch a Windows application by friendly name, executable name, or
+    full path. If `path` is given, the app is launched directly at/with
+    that file or folder as a CLI argument (e.g. opening VS Code at a
+    specific project folder) — only supported for PATH/exe-resolved apps,
+    not Store/UWP apps launched via shell:AppsFolder."""
     key = name.strip().lower()
 
     if key in PROTOCOL_APPS:
@@ -36,7 +44,7 @@ def open_application(name: str) -> CapabilityResult:
 
     target = FRIENDLY_APPS.get(key, name)
 
-    if os.path.isfile(target):
+    if os.path.isfile(target) and not path:
         try:
             os.startfile(target)
         except OSError as exc:
@@ -47,6 +55,13 @@ def open_application(name: str) -> CapabilityResult:
     if resolved is None:
         app_id = match_installed_app(name)
         if app_id is not None:
+            if path:
+                return CapabilityResult.fail(
+                    "open_application",
+                    f"'{name}' was found as an installed app, but it can't be "
+                    "launched with a target file/folder this way. Try opening "
+                    "it without a path, or open the folder separately.",
+                )
             try:
                 os.startfile(f"shell:AppsFolder\\{app_id}")
             except OSError as exc:
@@ -60,11 +75,14 @@ def open_application(name: str) -> CapabilityResult:
         )
 
     try:
-        subprocess.Popen([resolved])
+        if path:
+            subprocess.Popen([resolved, _resolve_target_path(path)])
+        else:
+            subprocess.Popen([resolved])
     except OSError as exc:
         return CapabilityResult.fail("open_application", f"Failed to launch '{name}': {exc}")
 
-    return CapabilityResult.ok("open_application", {"launched": resolved})
+    return CapabilityResult.ok("open_application", {"launched": resolved, "path": path})
 
 
 registry.register(
@@ -73,13 +91,23 @@ registry.register(
     description=(
         "Open/launch a Windows application by common name (e.g. 'notepad', "
         "'chrome', 'edge', 'calculator', 'task manager', 'camera', "
-        "'settings') or by executable name/path. Use this for opening the "
-        "app/browser itself, including 'a new chrome/edge window'."
+        "'settings', 'vscode') or by executable name/path. Use this for "
+        "opening the app itself, including 'a new chrome/edge window'. "
+        "If the user wants the app to open AT a specific file or folder "
+        "(e.g. 'open the jessy folder with VS Code'), pass that folder/"
+        "file's resolved path as 'path' — this opens the app directly "
+        "there in ONE call. Do not call open_folder separately in that "
+        "case; only use open_folder when the user wants File Explorer, "
+        "not another app."
     ),
     parameters={
         "type": "object",
         "properties": {
             "name": {"type": "string", "description": "Friendly app name, executable name, or full path to launch."},
+            "path": {
+                "type": ["string", "null"],
+                "description": "Optional file or folder path to open the app at/with, e.g. a project folder for VS Code. Omit or pass null to just launch the app normally.",
+            },
         },
         "required": ["name"],
     },
