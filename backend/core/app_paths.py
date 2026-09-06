@@ -52,6 +52,104 @@ PROTOCOL_APPS = {
     "calendar": "outlookcal:",
 }
 
+# Specific Settings sub-pages, keyed by the phrase a user is likely to say.
+# Matched by substring (either direction), preferring the longest/most
+# specific key, so "about this pc" wins over the shorter "about", and
+# "update window" (even with a typo) still resolves to Windows Update
+# instead of falling back to the generic root Settings page.
+SETTINGS_PAGES = {
+    "settings": "ms-settings:",
+    "about": "ms-settings:about",
+    "about this pc": "ms-settings:about",
+    "system": "ms-settings:system",
+    "display": "ms-settings:display",
+    "sound": "ms-settings:sound",
+    "notifications": "ms-settings:notifications",
+    "power": "ms-settings:powersleep",
+    "power and sleep": "ms-settings:powersleep",
+    "battery": "ms-settings:batterysaver",
+    "storage": "ms-settings:storagesense",
+    "bluetooth": "ms-settings:bluetooth",
+    "devices": "ms-settings:bluetooth",
+    "network": "ms-settings:network",
+    "wifi": "ms-settings:network-wifi",
+    "wi-fi": "ms-settings:network-wifi",
+    "personalization": "ms-settings:personalization",
+    "background": "ms-settings:personalization-background",
+    "wallpaper": "ms-settings:personalization-background",
+    "lock screen": "ms-settings:lockscreen",
+    "themes": "ms-settings:themes",
+    "apps": "ms-settings:appsfeatures",
+    "apps and features": "ms-settings:appsfeatures",
+    "accounts": "ms-settings:accounts",
+    "date and time": "ms-settings:dateandtime",
+    "time": "ms-settings:dateandtime",
+    "language": "ms-settings:regionlanguage",
+    "gaming": "ms-settings:gaming",
+    "ease of access": "ms-settings:easeofaccess",
+    "accessibility": "ms-settings:easeofaccess",
+    "privacy": "ms-settings:privacy",
+    "windows update": "ms-settings:windowsupdate",
+    "update": "ms-settings:windowsupdate",
+    "recovery": "ms-settings:recovery",
+    "activation": "ms-settings:activation",
+    "troubleshoot": "ms-settings:troubleshoot",
+}
+
+
+def match_friendly_name(name: str) -> str | None:
+    """Match a name against FRIENDLY_APPS exactly first, then by substring."""
+    key = name.strip().lower()
+    if key in FRIENDLY_APPS:
+        return FRIENDLY_APPS[key]
+    for friendly_key, exe in FRIENDLY_APPS.items():
+        if friendly_key in key or key in friendly_key:
+            return exe
+    return None
+
+
+def match_protocol_app(name: str) -> str | None:
+    key = name.strip().lower()
+    if key in PROTOCOL_APPS:
+        return PROTOCOL_APPS[key]
+    for friendly_key, proto in PROTOCOL_APPS.items():
+        if friendly_key in key or key in friendly_key:
+            return proto
+    return None
+
+
+def match_settings_page(name: str) -> str | None:
+    """Match free-form text (e.g. 'about this pc', 'update window',
+    'wifi settings') to the correct ms-settings: deep-link URI for that
+    specific page, instead of always falling back to the generic root
+    Settings page. Prefers the longest (most specific) matching key."""
+    key = name.strip().lower()
+    if not key:
+        return None
+
+    best_key = None
+    for page_key in SETTINGS_PAGES:
+        if page_key in key or key in page_key:
+            if best_key is None or len(page_key) > len(best_key):
+                best_key = page_key
+
+    return SETTINGS_PAGES[best_key] if best_key else None
+
+
+def resolve_executable(exe_name: str) -> str | None:
+    """Find a real path for an executable name via PATH, then known install locations."""
+    found_on_path = shutil.which(exe_name)
+    if found_on_path:
+        return found_on_path
+
+    for candidate in KNOWN_APP_PATHS.get(exe_name.lower(), []):
+        expanded = os.path.expandvars(candidate)
+        if os.path.isfile(expanded):
+            return expanded
+
+    return None
+
+
 KNOWN_APP_PATHS = {
     "chrome.exe": [
         r"%PROGRAMFILES%\Google\Chrome\Application\chrome.exe",
@@ -78,41 +176,6 @@ KNOWN_APP_PATHS = {
         r"%PROGRAMFILES%\Microsoft Office\Office16\POWERPNT.EXE",
     ],
 }
-
-
-def match_friendly_name(name: str) -> str | None:
-    """Match a name against FRIENDLY_APPS exactly first, then by substring."""
-    key = name.strip().lower()
-    if key in FRIENDLY_APPS:
-        return FRIENDLY_APPS[key]
-    for friendly_key, exe in FRIENDLY_APPS.items():
-        if friendly_key in key or key in friendly_key:
-            return exe
-    return None
-
-
-def match_protocol_app(name: str) -> str | None:
-    key = name.strip().lower()
-    if key in PROTOCOL_APPS:
-        return PROTOCOL_APPS[key]
-    for friendly_key, proto in PROTOCOL_APPS.items():
-        if friendly_key in key or key in friendly_key:
-            return proto
-    return None
-
-
-def resolve_executable(exe_name: str) -> str | None:
-    """Find a real path for an executable name via PATH, then known install locations."""
-    found_on_path = shutil.which(exe_name)
-    if found_on_path:
-        return found_on_path
-
-    for candidate in KNOWN_APP_PATHS.get(exe_name.lower(), []):
-        expanded = os.path.expandvars(candidate)
-        if os.path.isfile(expanded):
-            return expanded
-
-    return None
 
 
 # ---------------------------------------------------------------------------

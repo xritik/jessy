@@ -5,6 +5,8 @@ System information capabilities.
 from __future__ import annotations
 
 import os
+import subprocess
+import tempfile
 from datetime import datetime, timezone
 
 import psutil
@@ -78,6 +80,200 @@ def get_network_status() -> dict:
     return {"interfaces": interfaces}
 
 
+def disconnect_wifi() -> CapabilityResult:
+    """Disconnect the current WiFi connection without turning the radio off."""
+    try:
+        result = subprocess.run(
+            ["netsh", "wlan", "disconnect"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except OSError as exc:
+        return CapabilityResult.fail("disconnect_wifi", f"Failed to disconnect WiFi: {exc}")
+
+    if result.returncode != 0:
+        return CapabilityResult.fail(
+            "disconnect_wifi",
+            f"Failed to disconnect WiFi: {result.stderr.strip() or result.stdout.strip()}",
+        )
+    return CapabilityResult.ok("disconnect_wifi", {"disconnected": True})
+
+
+def connect_wifi(ssid: str, password: str | None = None) -> CapabilityResult:
+    """Connect to a WiFi network by SSID, switching away from any current
+    connection. If a saved profile for that network already exists,
+    connects directly. If not and a password is given, creates a
+    temporary profile first, then connects."""
+    ssid = ssid.strip()
+    if not ssid:
+        return CapabilityResult.fail("connect_wifi", "No SSID provided.")
+
+    try:
+        profiles = subprocess.run(
+            ["netsh", "wlan", "show", "profiles"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except OSError as exc:
+        return CapabilityResult.fail("connect_wifi", f"Failed to check saved networks: {exc}")
+
+    has_profile = ssid.lower() in profiles.lower()
+
+    if not has_profile:
+        if not password:
+            return CapabilityResult.fail(
+                "connect_wifi",
+                f"No saved profile for '{ssid}' and no password was provided. "
+                "Give me the password to connect for the first time.",
+            )
+        profile_xml = f"""<?xml version="1.0"?>
+<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">
+    <name>{ssid}</name>
+    <SSIDConfig><SSID><name>{ssid}</name></SSID></SSIDConfig>
+    <connectionType>ESS</connectionType>
+    <connectionMode>manual</connectionMode>
+    <MSM><security>
+        <authEncryption>
+            <authentication>WPA2PSK</authentication>
+            <encryption>AES</encryption>
+            <useOneX>false</useOneX>
+        </authEncryption>
+        <sharedKey>
+            <keyType>passPhrase</keyType>
+            <protected>false</protected>
+            <keyMaterial>{password}</keyMaterial>
+        </sharedKey>
+    </security></MSM>
+</WLANProfile>"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False) as f:
+            f.write(profile_xml)
+            profile_path = f.name
+        try:
+            add_result = subprocess.run(
+                ["netsh", "wlan", "add", "profile", f"filename={profile_path}"],
+                capture_output=True, text=True, timeout=10,
+            )
+        finally:
+            os.unlink(profile_path)
+        if add_result.returncode != 0:
+            return CapabilityResult.fail("connect_wifi", f"Failed to save network profile: {add_result.stderr.strip()}")
+
+    try:
+        result = subprocess.run(
+            ["netsh", "wlan", "connect", f"name={ssid}"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except OSError as exc:
+        return CapabilityResult.fail("connect_wifi", f"Failed to connect: {exc}")
+
+    if result.returncode != 0:
+        return CapabilityResult.fail(
+            "connect_wifi",
+            f"Failed to connect to '{ssid}': {result.stderr.strip() or result.stdout.strip()}",
+        )
+
+    return CapabilityResult.ok("connect_wifi", {"connected_to": ssid})
+
+
+def set_wifi_power(action: str) -> CapabilityResult:
+    """Turn the WiFi adapter on or off. Requires the server process to be
+    running elevated (as Administrator) -- Windows blocks adapter
+    enable/disable for non-admin processes."""
+    action = action.strip().lower()
+    if action not in ("on", "off"):
+        return CapabilityResult.fail("set_wifi_power", "action must be 'on' or 'off'.")
+
+    cmdlet = "Enable-NetAdapter" if action == "on" else "Disable-NetAdapter"
+    ps_script = (
+        f"$a = Get-NetAdapter | Where-Object "
+        f"{{$_.InterfaceDescription -match 'Wireless' -or $_.Name -match 'Wi-Fi'}}; "
+        f"if (-not $a) {{ exit 2 }}; "
+        f"{cmdlet} -Name $a.Name -Confirm:$false"
+    )
+
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True, text=True, timeout=15,
+        )
+    except OSError as exc:
+        return CapabilityResult.fail("set_wifi_power", f"Failed to turn WiFi {action}: {exc}")
+
+    if result.returncode == 2:
+        return CapabilityResult.fail("set_wifi_power", "No WiFi adapter was found.")
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "access" in stderr.lower() or "denied" in stderr.lower() or "administrator" in stderr.lower():
+            return CapabilityResult.fail(
+                "set_wifi_power",
+                "Turning WiFi on/off requires administrator privileges. "
+                "Restart the server as Administrator to enable this.",
+            )
+        return CapabilityResult.fail("set_wifi_power", f"Failed to turn WiFi {action}: {stderr or result.stdout.strip()}")
+
+    return CapabilityResult.ok("set_wifi_power", {"wifi": action})
+
+
+def set_bluetooth_power(action: str) -> CapabilityResult:
+    """Turn the Bluetooth radio on or off using the WinRT Radio API."""
+    action = action.strip().lower()
+    if action not in ("on", "off"):
+        return CapabilityResult.fail("set_bluetooth_power", "action must be 'on' or 'off'.")
+
+    state = "On" if action == "on" else "Off"
+    ps_script = f"""
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+
+Function Await($WinRtTask, $ResultType) {{
+    $asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{
+        $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+        $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+    }})[0]
+    $asTaskAsync = $asTask.MakeGenericMethod($ResultType).Invoke($null, @($WinRtTask))
+    $asTaskAsync.Wait(-1) | Out-Null
+    $asTaskAsync.Result
+}}
+[Windows.Devices.Radios.Radio,Windows.System.Devices,ContentType=WindowsRuntime] | Out-Null
+[Windows.Devices.Radios.RadioAccessStatus,Windows.System.Devices,ContentType=WindowsRuntime] | Out-Null
+
+$access = Await ([Windows.Devices.Radios.Radio]::RequestAccessAsync()) ([Windows.Devices.Radios.RadioAccessStatus])
+if ($access -ne 'Allowed') {{ exit 3 }}
+
+$radios = Await ([Windows.Devices.Radios.Radio]::GetRadiosAsync()) ([System.Collections.Generic.IReadOnlyList[Windows.Devices.Radios.Radio]])
+$bt = $radios | Where-Object {{ $_.Kind -eq 'Bluetooth' }}
+if (-not $bt) {{ exit 2 }}
+Await ($bt.SetStateAsync('{state}')) ([Windows.Devices.Radios.RadioAccessStatus]) | Out-Null
+"""
+
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True, text=True, timeout=15,
+        )
+    except OSError as exc:
+        return CapabilityResult.fail("set_bluetooth_power", f"Failed to turn Bluetooth {action}: {exc}")
+
+    if result.returncode == 3:
+        return CapabilityResult.fail(
+            "set_bluetooth_power",
+            "Windows denied radio access to this process. Run the server as Administrator, "
+            "or check Settings > Privacy & Security > Radios permissions.",
+        )
+    if result.returncode == 2:
+        return CapabilityResult.fail("set_bluetooth_power", "No Bluetooth radio was found on this device.")
+    if result.returncode != 0:
+        return CapabilityResult.fail(
+            "set_bluetooth_power",
+            f"Failed to turn Bluetooth {action}: {result.stderr.strip() or result.stdout.strip()}",
+        )
+    # Open Settings so the user can visually confirm the change
+    try:
+        subprocess.Popen(["explorer.exe", "ms-settings:bluetooth"])
+    except OSError:
+        pass
+
+
+    return CapabilityResult.ok("set_bluetooth_power", {"bluetooth": action})
+
+
 registry.register(
     name="get_current_time",
     function=get_current_time,
@@ -130,4 +326,55 @@ registry.register(
     description="List network interfaces and whether each is currently up/connected.",
     parameters={"type": "object", "properties": {}, "required": []},
     risk="safe",
+)
+
+registry.register(
+    name="disconnect_wifi",
+    function=disconnect_wifi,
+    description="Disconnect the current WiFi network connection (radio stays on).",
+    parameters={"type": "object", "properties": {}, "required": []},
+    risk="moderate",
+)
+
+registry.register(
+    name="connect_wifi",
+    function=connect_wifi,
+    description="Connect to a specific WiFi network by SSID, switching away from any current connection. Provide password if connecting for the first time.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "ssid": {"type": "string", "description": "The WiFi network name to connect to."},
+            "password": {"type": ["string", "null"], "description": "Network password, only needed if there's no saved profile for this SSID yet."},
+        },
+        "required": ["ssid"],
+    },
+    risk="moderate",
+)
+
+registry.register(
+    name="set_wifi_power",
+    function=set_wifi_power,
+    description="Turn the WiFi radio/adapter fully on or off (not just disconnect). Requires admin privileges.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["on", "off"], "description": "Whether to turn WiFi on or off."},
+        },
+        "required": ["action"],
+    },
+    risk="moderate",
+)
+
+registry.register(
+    name="set_bluetooth_power",
+    function=set_bluetooth_power,
+    description="Turn the Bluetooth radio on or off.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["on", "off"], "description": "Whether to turn Bluetooth on or off."},
+        },
+        "required": ["action"],
+    },
+    risk="moderate",
 )
