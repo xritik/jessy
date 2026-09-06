@@ -23,6 +23,15 @@ YouTube's search results HTML for the first "videoId" occurrence (no API
 key required), then opens that video's watch URL with autoplay=1 — this
 is what makes it actually PLAY something instead of just opening a
 search results listing.
+
+Window activation uses AttachThreadInput rather than plain
+SetForegroundWindow/SwitchToThisWindow, because Windows' focus-stealing
+prevention silently denies foreground requests from background processes
+(visible as a blinking taskbar icon while the target window never
+actually comes forward). AttachThreadInput temporarily borrows the
+currently-foreground thread's input permissions so our activation
+request is treated as if it came from the already-focused app, which
+Windows allows.
 """
 
 from __future__ import annotations
@@ -37,6 +46,14 @@ import urllib.parse
 import urllib.request
 
 import uiautomation as auto
+
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()  # fallback for older Windows
+    except Exception:
+        pass
 
 from core.app_paths import resolve_executable
 from core.registry import registry
@@ -212,8 +229,6 @@ def _fetch_first_youtube_video_id_via_scrape(query: str) -> str | None:
     return None
 
 
-
-
 def play_youtube(query: str, browser: str | None = None, new_window: bool = False) -> CapabilityResult:
     t0 = time.monotonic()
     query = query.strip()
@@ -265,8 +280,76 @@ registry.register(
 
 
 # ---------------------------------------------------------------------------
-# Tab-level inspection & closing via UI Automation.
+# Window activation & tab-level inspection via UI Automation.
 # ---------------------------------------------------------------------------
+
+def _force_activate_window(win: auto.Control) -> bool:
+    """Bring a window to the foreground reliably. Plain SetForegroundWindow/
+    SwitchToThisWindow is often denied by Windows' focus-stealing
+    prevention, so we use AttachThreadInput to borrow the foreground
+    thread's input permissions. Critically, SW_RESTORE is only ever sent
+    when the window is ACTUALLY iconic — sending it unconditionally on an
+    already-normal Chromium window can race with Chrome's own custom-frame
+    animation and cause it to flip into minimized state right after being
+    activated. A final verify-and-recover pass guards against that. Returns
+    True only if the window ends up both foreground and not minimized."""
+    hwnd = win.NativeWindowHandle
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    SW_RESTORE = 9
+
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        time.sleep(0.15)
+
+    if user32.GetForegroundWindow() == hwnd and not user32.IsIconic(hwnd):
+        time.sleep(0.1)
+        return True
+
+    fg_hwnd = user32.GetForegroundWindow()
+    fg_thread = user32.GetWindowThreadProcessId(fg_hwnd, None)
+    target_thread = user32.GetWindowThreadProcessId(hwnd, None)
+    current_thread = kernel32.GetCurrentThreadId()
+
+    attached_fg = False
+    attached_target = False
+    try:
+        if fg_thread and fg_thread != current_thread:
+            attached_fg = bool(user32.AttachThreadInput(current_thread, fg_thread, True))
+        if target_thread and target_thread != current_thread:
+            attached_target = bool(user32.AttachThreadInput(current_thread, target_thread, True))
+
+        user32.BringWindowToTop(hwnd)
+        if user32.IsIconic(hwnd):  # only restore if genuinely minimized
+            user32.ShowWindow(hwnd, SW_RESTORE)
+        user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+    finally:
+        if attached_fg:
+            try:
+                user32.AttachThreadInput(current_thread, fg_thread, False)
+            except Exception:
+                pass
+        if attached_target:
+            try:
+                user32.AttachThreadInput(current_thread, target_thread, False)
+            except Exception:
+                pass
+
+    time.sleep(0.15)
+
+    # Final safety net: something (Chrome's own frame animation, DWM, etc.)
+    # can still flip the window back to iconic right after activation.
+    # Catch and undo that before reporting success.
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        time.sleep(0.15)
+        user32.SetForegroundWindow(hwnd)
+        time.sleep(0.1)
+
+    return user32.GetForegroundWindow() == hwnd and not user32.IsIconic(hwnd)
+
 
 def _ensure_com_initialized() -> None:
     """UI Automation runs over COM, which must be initialized per-thread.
@@ -414,8 +497,10 @@ def close_browser_tab(title_query: str, browser: str | None = None) -> Capabilit
 
         if matched_tab is not None:
             try:
-                win.SetActive()
-                time.sleep(0.2)
+                if not _force_activate_window(win):
+                    return CapabilityResult.fail(
+                        "close_browser_tab", "Could not bring the browser window to the foreground."
+                    )
                 matched_tab.Click(simulateMove=False)
                 time.sleep(0.2)
                 auto.SendKeys("{Ctrl}w")
@@ -451,6 +536,276 @@ registry.register(
             "browser": {"type": "string", "description": "Optional: 'chrome' or 'edge' to restrict the search."},
         },
         "required": ["title_query"],
+    },
+    risk="safe",
+)
+
+# ---------------------------------------------------------------------------
+# Active-tab control: switch to, navigate, scroll, reopen — without
+# closing or disturbing any other tabs/windows.
+# ---------------------------------------------------------------------------
+
+def switch_to_tab(title_query: str, browser: str | None = None) -> CapabilityResult:
+    """Bring a specific already-open tab to the foreground (by title or URL
+    match) without closing anything. Use this instead of open_url when the
+    user wants to go back to a tab that's already open."""
+    query = title_query.strip()
+    if not query:
+        return CapabilityResult.fail("switch_to_tab", "No tab title/text to match was provided.")
+
+    _ensure_com_initialized()
+
+    try:
+        windows = _find_chromium_windows(browser)
+    except Exception as exc:
+        logger.exception("UIA window enumeration failed")
+        return CapabilityResult.fail("switch_to_tab", f"Could not scan browser windows: {exc}")
+
+    if not windows:
+        return CapabilityResult.fail(
+            "switch_to_tab", f"No open {browser or 'Chrome/Edge'} window was found."
+        )
+
+    pattern = re.compile(re.escape(query), re.IGNORECASE)
+    seen_titles: list[str] = []
+
+    for win in windows:
+        tab_items = _collect_tab_items(win)
+        seen_titles.extend(t.Name for t in tab_items if t.Name)
+
+        matched_tab = next((t for t in tab_items if t.Name and pattern.search(t.Name)), None)
+        if matched_tab is None:
+            address = _get_address_bar_text(win)
+            if address and pattern.search(address) and len(tab_items) == 1:
+                matched_tab = tab_items[0]
+
+        if matched_tab is not None:
+            try:
+                if not _force_activate_window(win):
+                    return CapabilityResult.fail(
+                        "switch_to_tab", "Could not bring the browser window to the foreground."
+                    )
+                matched_tab.Click(simulateMove=False)
+            except Exception as exc:
+                logger.exception("UIA click failed on tab matching '%s'", query)
+                return CapabilityResult.fail("switch_to_tab", f"Found the tab but failed to switch to it: {exc}")
+            return CapabilityResult.ok(
+                "switch_to_tab", {"switched_to_tab_matching": query, "browser": browser or "chromium"}
+            )
+
+    return CapabilityResult.fail(
+        "switch_to_tab",
+        f"No open tab matching '{query}' was found in {browser or 'Chrome/Edge'}. "
+        f"Open tab titles were: {seen_titles or '[]'}.",
+    )
+
+
+registry.register(
+    name="switch_to_tab",
+    function=switch_to_tab,
+    description=(
+        "Bring an already-open browser tab to the foreground by matching "
+        "part of its title or URL, without closing or opening anything. "
+        "Use this when the user wants to go back to a tab that's already "
+        "open, instead of open_url (which may open a duplicate)."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "title_query": {"type": "string", "description": "Text to match in the tab's title or URL."},
+            "browser": {"type": "string", "description": "Optional: 'chrome' or 'edge' to restrict the search."},
+        },
+        "required": ["title_query"],
+    },
+    risk="safe",
+)
+
+
+def navigate_active_tab(url: str, browser: str | None = None) -> CapabilityResult:
+    """Navigate the currently active tab to a new URL, replacing its
+    current page, instead of opening a new tab."""
+    url = url.strip()
+    if not url:
+        return CapabilityResult.fail("navigate_active_tab", "No URL provided.")
+    target = url if url.startswith(("http://", "https://")) else f"https://{url}"
+
+    _ensure_com_initialized()
+
+    try:
+        windows = _find_chromium_windows(browser)
+    except Exception as exc:
+        logger.exception("UIA window enumeration failed")
+        return CapabilityResult.fail("navigate_active_tab", f"Could not scan browser windows: {exc}")
+
+    if not windows:
+        return CapabilityResult.fail(
+            "navigate_active_tab", f"No open {browser or 'Chrome/Edge'} window was found."
+        )
+
+    win = windows[0]
+    try:
+        if not _force_activate_window(win):
+            return CapabilityResult.fail(
+                "navigate_active_tab", "Could not bring the browser window to the foreground."
+            )
+        edit = win.EditControl(searchDepth=12)
+        if not edit.Exists(1, 0.3):
+            return CapabilityResult.fail("navigate_active_tab", "Could not locate the address bar.")
+        pattern = edit.GetValuePattern()
+        if pattern is None:
+            return CapabilityResult.fail("navigate_active_tab", "Address bar does not support text input.")
+        pattern.SetValue(target)
+        auto.SendKeys("{Enter}")
+    except Exception as exc:
+        logger.exception("Failed to navigate active tab")
+        return CapabilityResult.fail("navigate_active_tab", f"Failed to navigate: {exc}")
+
+    return CapabilityResult.ok("navigate_active_tab", {"url": target, "browser": browser or "chromium"})
+
+
+registry.register(
+    name="navigate_active_tab",
+    function=navigate_active_tab,
+    description=(
+        "Navigate the CURRENTLY ACTIVE tab to a new URL, replacing its "
+        "page in place. Use this when the user wants to 'go to X' in the "
+        "tab that's already open/focused, instead of opening a new one."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "URL or site to navigate to."},
+            "browser": {"type": "string", "description": "Optional: 'chrome' or 'edge' to restrict the search."},
+        },
+        "required": ["url"],
+    },
+    risk="safe",
+)
+
+
+def scroll_active_tab(direction: str = "down", amount: int = 3, browser: str | None = None) -> CapabilityResult:
+    """Scroll the currently active tab up or down using simulated mouse-wheel
+    input (targets whatever is under the cursor, not keyboard focus — so it
+    works even if focus is stuck on the address bar/tab strip)."""
+    direction = direction.strip().lower()
+    if direction not in ("up", "down"):
+        return CapabilityResult.fail("scroll_active_tab", "direction must be 'up' or 'down'.")
+
+    _ensure_com_initialized()
+
+    try:
+        windows = _find_chromium_windows(browser)
+    except Exception as exc:
+        logger.exception("UIA window enumeration failed")
+        return CapabilityResult.fail("scroll_active_tab", f"Could not scan browser windows: {exc}")
+
+    if not windows:
+        return CapabilityResult.fail(
+            "scroll_active_tab", f"No open {browser or 'Chrome/Edge'} window was found."
+        )
+
+    win = windows[0]
+    try:
+        if not _force_activate_window(win):
+            return CapabilityResult.fail(
+                "scroll_active_tab", "Could not bring the Chrome window to the foreground."
+            )
+
+        # Guard against a cold-start UIA cache glitch: the very first
+        # BoundingRectangle read after startup can return a stale/degenerate
+        # rect (e.g. all zeros) before the live query populates. Retry a
+        # couple of times with a fresh window lookup if that happens.
+        rect = win.BoundingRectangle
+        attempts = 0
+        while (rect.right <= rect.left or rect.bottom <= rect.top) and attempts < 3:
+            time.sleep(0.15)
+            windows = _find_chromium_windows(browser)
+            if not windows:
+                return CapabilityResult.fail(
+                    "scroll_active_tab", f"No open {browser or 'Chrome/Edge'} window was found."
+                )
+            win = windows[0]
+            rect = win.BoundingRectangle
+            attempts += 1
+
+        if rect.right <= rect.left or rect.bottom <= rect.top:
+            return CapabilityResult.fail(
+                "scroll_active_tab", "Could not determine the browser window's position on screen."
+            )
+
+        x = (rect.left + rect.right) // 2
+        y = rect.top + 220
+
+        auto.SetCursorPos(x, y)
+        time.sleep(0.1)
+
+        if direction == "down":
+            auto.WheelDown(wheelTimes=amount)
+        else:
+            auto.WheelUp(wheelTimes=amount)
+    except Exception as exc:
+        logger.exception("Failed to scroll active tab")
+        return CapabilityResult.fail("scroll_active_tab", f"Failed to scroll: {exc}")
+
+    return CapabilityResult.ok("scroll_active_tab", {"direction": direction, "amount": amount})
+
+
+registry.register(
+    name="scroll_active_tab",
+    function=scroll_active_tab,
+    description="Scroll the currently active browser tab up or down.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "direction": {"type": "string", "enum": ["up", "down"], "description": "Scroll direction."},
+            "amount": {"type": "integer", "description": "Number of scroll steps. Defaults to 3."},
+            "browser": {"type": "string", "description": "Optional: 'chrome' or 'edge' to restrict the search."},
+        },
+        "required": ["direction"],
+    },
+    risk="safe",
+)
+
+
+def reopen_closed_tab(browser: str | None = None) -> CapabilityResult:
+    """Reopen the most recently closed tab (undo a close), in a given/any
+    running Chromium browser window."""
+    _ensure_com_initialized()
+
+    try:
+        windows = _find_chromium_windows(browser)
+    except Exception as exc:
+        logger.exception("UIA window enumeration failed")
+        return CapabilityResult.fail("reopen_closed_tab", f"Could not scan browser windows: {exc}")
+
+    if not windows:
+        return CapabilityResult.fail(
+            "reopen_closed_tab", f"No open {browser or 'Chrome/Edge'} window was found."
+        )
+
+    try:
+        if not _force_activate_window(windows[0]):
+            return CapabilityResult.fail(
+                "reopen_closed_tab", "Could not bring the browser window to the foreground."
+            )
+        auto.SendKeys("{Ctrl}{Shift}t")
+    except Exception as exc:
+        logger.exception("Failed to reopen closed tab")
+        return CapabilityResult.fail("reopen_closed_tab", f"Failed to reopen tab: {exc}")
+
+    return CapabilityResult.ok("reopen_closed_tab", {"browser": browser or "chromium"})
+
+
+registry.register(
+    name="reopen_closed_tab",
+    function=reopen_closed_tab,
+    description="Reopen the most recently closed browser tab (undo a close).",
+    parameters={
+        "type": "object",
+        "properties": {
+            "browser": {"type": "string", "description": "Optional: 'chrome' or 'edge' to restrict the search."},
+        },
+        "required": [],
     },
     risk="safe",
 )

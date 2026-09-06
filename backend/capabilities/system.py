@@ -11,6 +11,7 @@ import comtypes
 import traceback
 import wmi
 import psutil
+import capabilities.terminal  # noqa: F401
 
 
 from datetime import datetime, timezone
