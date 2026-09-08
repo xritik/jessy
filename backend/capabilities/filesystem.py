@@ -4,6 +4,17 @@ Filesystem capabilities.
 Paths accept "~", environment variables, and relative paths, and are
 resolved to absolute paths before use. Destructive operations (delete,
 move, overwrite) are tagged risk="confirm" for the future Safety Layer.
+
+Editing behavior note:
+    Any capability that modifies an EXISTING file's content (e.g.
+    append_to_file) opens the file visibly in VS Code first, then writes
+    the new content one line at a time with a short pause between lines.
+    This lets the user watch the change happen live in the editor (VS
+    Code auto-reloads a file changed on disk as long as it has no
+    unsaved edits open), rather than the content just silently appearing
+    all at once. write_file for brand-new/overwritten files still writes
+    in one shot, since there is nothing meaningful to "watch" for a fresh
+    file being created from scratch.
 """
 
 from __future__ import annotations
@@ -12,6 +23,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 
 from capabilities.guard import is_protected_path
 from core.registry import registry
@@ -88,6 +100,80 @@ def write_file(path: str, content: str, overwrite: bool = False) -> CapabilityRe
         return CapabilityResult.fail("write_file", f"Permission denied: {resolved}")
 
     return CapabilityResult.ok("write_file", {"path": resolved, "bytes_written": len(content.encode("utf-8"))})
+
+
+def append_to_file(path: str, content: str, ensure_newline: bool = True, line_delay_seconds: float = 0.15) -> CapabilityResult:
+    """
+    Append text or code to the END of an existing file WITHOUT deleting
+    or replacing its current contents. If the file doesn't exist yet, it
+    is created. This is SAFE (never destructive), unlike write_file.
+
+    Before writing, the file is opened visibly in VS Code (reusing the
+    current window via 'code -r'), then the new content is appended one
+    line at a time with a short pause between lines, so the user can
+    watch it being written live in the editor instead of it appearing
+    all at once.
+
+    path: supports '~' for home directory, resolved before use.
+    content: the text/code to append.
+    ensure_newline: if True (default), a newline is inserted before the
+        appended content when the file already has content and doesn't
+        already end in one.
+    line_delay_seconds: pause between writing each line, purely for the
+        visible "typing" effect. Set to 0 to disable the pause.
+    """
+    resolved = _resolve(path)
+
+    if is_protected_path(os.path.dirname(resolved) or resolved):
+        return CapabilityResult.fail("append_to_file", f"Refusing to write into protected system path: {resolved}")
+
+    try:
+        os.makedirs(os.path.dirname(resolved), exist_ok=True)
+
+        # Create the file first if it doesn't exist yet, so VS Code has
+        # something to open.
+        if not os.path.exists(resolved):
+            open(resolved, "a", encoding="utf-8").close()
+
+        code_cli = shutil.which("code") or shutil.which("code.cmd")
+        if code_cli:
+            try:
+                subprocess.Popen([code_cli, "-r", resolved])
+                # Brief pause so VS Code actually has the file open before
+                # we start writing to it, so the live-update effect works.
+                time.sleep(0.6)
+            except OSError:
+                pass  # Non-fatal: fall through and write the file anyway.
+
+        prefix = ""
+        if ensure_newline and os.path.getsize(resolved) > 0:
+            with open(resolved, "rb") as f:
+                f.seek(-1, os.SEEK_END)
+                last_byte = f.read(1)
+            if last_byte not in (b"\n", b""):
+                prefix = "\n"
+
+        full_content = prefix + content
+        lines = full_content.splitlines(keepends=True)
+        if not lines:
+            lines = [full_content]
+
+        with open(resolved, "a", encoding="utf-8") as f:
+            for line in lines:
+                f.write(line)
+                f.flush()
+                if line_delay_seconds > 0:
+                    time.sleep(line_delay_seconds)
+
+    except PermissionError:
+        return CapabilityResult.fail("append_to_file", f"Permission denied: {resolved}")
+    except OSError as exc:
+        return CapabilityResult.fail("append_to_file", f"OSError: {exc}")
+
+    return CapabilityResult.ok("append_to_file", {
+        "path": resolved,
+        "appended_bytes": len((prefix + content).encode("utf-8")),
+    })
 
 
 def create_directory(path: str) -> CapabilityResult:
@@ -363,6 +449,30 @@ registry.register(
         "required": ["path", "content"],
     },
     risk="confirm",
+)
+
+registry.register(
+    name="append_to_file",
+    function=append_to_file,
+    description=(
+        "Append text or code to the END of an existing file WITHOUT "
+        "deleting or replacing its current contents. Use this whenever "
+        "the user asks to 'add', 'also include', 'append', or 'put "
+        "another X on top of' something in a file that may already have "
+        "content. Opens the file visibly in VS Code and writes the new "
+        "content line by line so the user can watch it happen. Do NOT "
+        "use write_file for these cases — write_file erases the whole "
+        "file first."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path of the file to append to."},
+            "content": {"type": "string", "description": "Text/code to append to the end of the file."},
+        },
+        "required": ["path", "content"],
+    },
+    risk="safe",
 )
 
 registry.register(

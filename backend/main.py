@@ -95,6 +95,19 @@ def debug_spawn_test():
 # -------------------------------------------------------------------------
 
 
+# Friendly, user-facing message shown whenever the agent fails to run at
+# all (rate limits, provider outage, unexpected exception, etc). Keeps
+# the API returning a normal 200 with a short one-liner instead of a
+# raw 500 + stack trace, which is nicer for the frontend/CLI to display.
+RATE_LIMIT_MESSAGE = (
+    "I'm a bit overloaded right now (hit my API rate limit) — "
+    "please try again in a few minutes."
+)
+GENERIC_FAILURE_MESSAGE = (
+    "Something went wrong on my end while processing that. Please try again."
+)
+
+
 @app.post("/chat", response_model=ChatResponse, tags=["agent"])
 async def chat(request: ChatRequest):
     """
@@ -112,10 +125,28 @@ async def chat(request: ChatRequest):
     history = get_history(session_id)
 
     try:
-        final_text, step_logs = agent.run(user_message=request.message, history=history)
-    except Exception as exc:
+        final_text, step_logs = agent.run(user_message=request.message, history=history, session_id=session_id)
+    except RuntimeError as exc:
+        # Raised by groq_client.chat() when every configured API key has
+        # hit its rate limit. Degrade gracefully instead of a raw 500.
+        if "rate limit" in str(exc).lower():
+            logger.warning("Groq rate limit hit for session %s: %s", session_id, exc)
+            append_message(session_id, "user", request.message)
+            append_message(session_id, "assistant", RATE_LIMIT_MESSAGE)
+            return ChatResponse(response=RATE_LIMIT_MESSAGE, steps=0)
+
+        logger.exception("Agent run failed with RuntimeError")
+        append_message(session_id, "user", request.message)
+        append_message(session_id, "assistant", GENERIC_FAILURE_MESSAGE)
+        return ChatResponse(response=GENERIC_FAILURE_MESSAGE, steps=0)
+    except Exception:
+        # Catch-all: never let an unexpected agent failure surface as a
+        # raw 500 with a stack trace to the caller. Log full details
+        # server-side, but return a clean one-liner to the client.
         logger.exception("Agent run failed")
-        raise HTTPException(status_code=500, detail=f"Agent error: {exc}") from exc
+        append_message(session_id, "user", request.message)
+        append_message(session_id, "assistant", GENERIC_FAILURE_MESSAGE)
+        return ChatResponse(response=GENERIC_FAILURE_MESSAGE, steps=0)
 
     append_message(session_id, "user", request.message)
     append_message(session_id, "assistant", final_text)

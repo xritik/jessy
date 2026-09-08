@@ -346,6 +346,21 @@ def _collect_tab_items(win: auto.Control) -> list[auto.Control]:
         logger.exception("Failed to locate tab strip for window '%s'", win.Name)
     return []
 
+def _pick_primary_window(windows: list[auto.Control]) -> auto.Control:
+    """Prefer whichever discovered Chromium window is currently the
+    foreground window (e.g. the one open_application just activated, or
+    whichever the user was last interacting with), falling back to the
+    first discovered window only if none match. This guards against
+    acting on the wrong window in the rare case where more than one
+    genuine Chrome/Edge window is open at once."""
+    try:
+        fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
+        for w in windows:
+            if w.NativeWindowHandle == fg_hwnd:
+                return w
+    except Exception:
+        pass
+    return windows[0]
 
 def list_browser_tabs(browser: str | None = None) -> CapabilityResult:
     """List every open tab's title (and the active tab's URL per window)."""
@@ -583,7 +598,7 @@ def switch_tab_direction(direction: str, browser: str | None = None) -> Capabili
             "switch_tab_direction", f"No open {browser or 'Chrome/Edge'} window was found."
         )
 
-    win = windows[0]
+    win = _pick_primary_window(windows)
     try:
         if not _force_activate_window(win):
             return CapabilityResult.fail(
@@ -733,7 +748,7 @@ def scroll_active_tab(direction: str = "down", amount: int = 3, browser: str | N
                 return CapabilityResult.fail(
                     "scroll_active_tab", f"No open {browser or 'Chrome/Edge'} window was found."
                 )
-            win = windows[0]
+            win = _pick_primary_window(windows)
             rect = win.BoundingRectangle
             attempts += 1
 
@@ -793,7 +808,8 @@ def reopen_closed_tab(browser: str | None = None) -> CapabilityResult:
         )
 
     try:
-        if not _force_activate_window(windows[0]):
+        target_window = _pick_primary_window(windows)
+        if not _force_activate_window(target_window):
             return CapabilityResult.fail(
                 "reopen_closed_tab", "Could not bring the browser window to the foreground."
             )

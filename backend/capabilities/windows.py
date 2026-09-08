@@ -10,6 +10,17 @@ After every launch, briefly forces the new window to the foreground.
 Without this, a window opened by a background process (like this server)
 is blocked by Windows' focus-stealing prevention and only flashes in the
 taskbar until the user clicks it themselves.
+
+Browser dedup fix:
+    Launching chrome.exe/msedge.exe again with NO url/tab argument makes
+    the browser's own singleton logic open a brand-new window, even when
+    an instance is already running with tabs open. This previously caused
+    "open chrome" (as a lead-in to "then switch tabs / search there") to
+    spawn a second, unrelated window -- so subsequent tab-switching and
+    searching acted on the wrong (freshly created) window instead of the
+    user's existing one. open_application now checks for an already-open
+    chrome.exe/msedge.exe window first and, if found, simply brings that
+    window forward instead of launching a duplicate.
 """
 
 from __future__ import annotations
@@ -54,6 +65,11 @@ PROTOCOL_APP_PROCESS_HINTS: dict[str, set[str]] = {
     "mail": {"hxmail.exe", "olk.exe"},
     "calendar": {"hxcalendarappimm.exe", "hxcalendar.exe"},
 }
+
+# Browser executables that must never be launched a second time while an
+# instance is already open -- see the module docstring's "Browser dedup
+# fix" note above.
+_BROWSER_PROCESS_NAMES = {"chrome.exe", "msedge.exe"}
 
 
 def _resolve_target_path(path: str) -> str:
@@ -129,6 +145,23 @@ def _bring_process_window_to_front(exe_names: set[str], timeout: float = 3.0) ->
     return True
 
 
+def _find_existing_browser_window_hwnd(exe_name: str) -> int | None:
+    """Find a visible top-level window already owned by a running browser
+    process (chrome.exe/msedge.exe), so open_application can reuse it
+    instead of launching a duplicate window. Launching chrome.exe/msedge.exe
+    again with no URL argument triggers the browser's own default
+    'open a new window' behavior even when an instance is already running
+    -- this is what previously caused 'open chrome' to spawn a second
+    window instead of bringing the existing one (with all its tabs)
+    forward. Returns the first matching hwnd, or None if that browser
+    isn't currently running with any visible window."""
+    exe_name = exe_name.lower()
+    for w in _enum_windows():
+        if _get_process_image_name(w["pid"]) == exe_name:
+            return w["hwnd"]
+    return None
+
+
 def open_application(name: str, path: str | None = None) -> CapabilityResult:
     """Launch a Windows application by friendly name, executable name, or
     full path. If `path` is given, the app is launched directly at/with
@@ -161,6 +194,21 @@ def open_application(name: str, path: str | None = None) -> CapabilityResult:
         return CapabilityResult.ok("open_application", {"launched": protocol})
 
     target = FRIENDLY_APPS.get(key, name)
+
+    # Browser dedup: if this is chrome/edge and a window is already open,
+    # just bring it forward instead of launching a second window (see the
+    # module docstring's "Browser dedup fix" note).
+    browser_exe = os.path.basename(target).lower()
+    if browser_exe in _BROWSER_PROCESS_NAMES and not path:
+        existing_hwnd = _find_existing_browser_window_hwnd(browser_exe)
+        if existing_hwnd is not None:
+            if force_activate_window(existing_hwnd):
+                return CapabilityResult.ok(
+                    "open_application",
+                    {"launched": target, "reused_existing_window": True, "hwnd": existing_hwnd},
+                )
+            # Activation failed for some reason; fall through to the
+            # normal launch path below as a last-resort fallback.
 
     if os.path.isfile(target) and not path:
         try:
