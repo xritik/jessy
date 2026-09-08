@@ -10,3 +10,5 @@ from capabilities import filesystem  # noqa: F401
 from capabilities import windows     # noqa: F401
 from capabilities import process     # noqa: F401
 from capabilities import browser     # noqa: F401
+from capabilities import input       # noqa: F401
+from capabilities import editor      # noqa: F401

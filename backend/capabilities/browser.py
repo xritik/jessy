@@ -58,6 +58,7 @@ except Exception:
 from core.app_paths import resolve_executable
 from core.registry import registry
 from core.result import CapabilityResult
+from core.window_focus import force_activate_window
 
 logger = logging.getLogger("jessy.browser")
 
@@ -284,71 +285,9 @@ registry.register(
 # ---------------------------------------------------------------------------
 
 def _force_activate_window(win: auto.Control) -> bool:
-    """Bring a window to the foreground reliably. Plain SetForegroundWindow/
-    SwitchToThisWindow is often denied by Windows' focus-stealing
-    prevention, so we use AttachThreadInput to borrow the foreground
-    thread's input permissions. Critically, SW_RESTORE is only ever sent
-    when the window is ACTUALLY iconic — sending it unconditionally on an
-    already-normal Chromium window can race with Chrome's own custom-frame
-    animation and cause it to flip into minimized state right after being
-    activated. A final verify-and-recover pass guards against that. Returns
-    True only if the window ends up both foreground and not minimized."""
-    hwnd = win.NativeWindowHandle
-    user32 = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
-    SW_RESTORE = 9
-
-    if user32.IsIconic(hwnd):
-        user32.ShowWindow(hwnd, SW_RESTORE)
-        time.sleep(0.15)
-
-    if user32.GetForegroundWindow() == hwnd and not user32.IsIconic(hwnd):
-        time.sleep(0.1)
-        return True
-
-    fg_hwnd = user32.GetForegroundWindow()
-    fg_thread = user32.GetWindowThreadProcessId(fg_hwnd, None)
-    target_thread = user32.GetWindowThreadProcessId(hwnd, None)
-    current_thread = kernel32.GetCurrentThreadId()
-
-    attached_fg = False
-    attached_target = False
-    try:
-        if fg_thread and fg_thread != current_thread:
-            attached_fg = bool(user32.AttachThreadInput(current_thread, fg_thread, True))
-        if target_thread and target_thread != current_thread:
-            attached_target = bool(user32.AttachThreadInput(current_thread, target_thread, True))
-
-        user32.BringWindowToTop(hwnd)
-        if user32.IsIconic(hwnd):  # only restore if genuinely minimized
-            user32.ShowWindow(hwnd, SW_RESTORE)
-        user32.SetForegroundWindow(hwnd)
-    except Exception:
-        pass
-    finally:
-        if attached_fg:
-            try:
-                user32.AttachThreadInput(current_thread, fg_thread, False)
-            except Exception:
-                pass
-        if attached_target:
-            try:
-                user32.AttachThreadInput(current_thread, target_thread, False)
-            except Exception:
-                pass
-
-    time.sleep(0.15)
-
-    # Final safety net: something (Chrome's own frame animation, DWM, etc.)
-    # can still flip the window back to iconic right after activation.
-    # Catch and undo that before reporting success.
-    if user32.IsIconic(hwnd):
-        user32.ShowWindow(hwnd, SW_RESTORE)
-        time.sleep(0.15)
-        user32.SetForegroundWindow(hwnd)
-        time.sleep(0.1)
-
-    return user32.GetForegroundWindow() == hwnd and not user32.IsIconic(hwnd)
+    """Thin wrapper over core.window_focus so this fix lives in exactly
+    one place, shared with capabilities/windows.py."""
+    return force_activate_window(win.NativeWindowHandle)
 
 
 def _ensure_com_initialized() -> None:
@@ -616,6 +555,76 @@ registry.register(
             "browser": {"type": "string", "description": "Optional: 'chrome' or 'edge' to restrict the search."},
         },
         "required": ["title_query"],
+    },
+    risk="safe",
+)
+
+def switch_tab_direction(direction: str, browser: str | None = None) -> CapabilityResult:
+    """Cycle the browser's active tab to the next/previous tab (like
+    pressing Ctrl+Tab), after force-activating that browser window
+    FIRST — so the keystroke reliably lands on the browser, not
+    whatever window currently has OS-level focus (e.g. VS Code)."""
+    direction = direction.strip().lower()
+    if direction not in ("next", "previous", "right", "left"):
+        return CapabilityResult.fail(
+            "switch_tab_direction", "direction must be 'next'/'right' or 'previous'/'left'."
+        )
+
+    _ensure_com_initialized()
+
+    try:
+        windows = _find_chromium_windows(browser)
+    except Exception as exc:
+        logger.exception("UIA window enumeration failed")
+        return CapabilityResult.fail("switch_tab_direction", f"Could not scan browser windows: {exc}")
+
+    if not windows:
+        return CapabilityResult.fail(
+            "switch_tab_direction", f"No open {browser or 'Chrome/Edge'} window was found."
+        )
+
+    win = windows[0]
+    try:
+        if not _force_activate_window(win):
+            return CapabilityResult.fail(
+                "switch_tab_direction", "Could not bring the browser window to the foreground."
+            )
+        if direction in ("next", "right"):
+            auto.SendKeys("{Ctrl}{Tab}")
+        else:
+            auto.SendKeys("{Ctrl}{Shift}{Tab}")
+    except Exception as exc:
+        logger.exception("Failed to switch tab direction")
+        return CapabilityResult.fail("switch_tab_direction", f"Failed to switch tab: {exc}")
+
+    return CapabilityResult.ok(
+        "switch_tab_direction", {"direction": direction, "browser": browser or "chromium"}
+    )
+
+
+registry.register(
+    name="switch_tab_direction",
+    function=switch_tab_direction,
+    description=(
+        "Cycle the browser's ACTIVE tab to the next ('next' or 'right') or "
+        "previous ('previous' or 'left') tab within a browser window, like "
+        "pressing Ctrl+Tab. This ALWAYS force-activates the target browser "
+        "window first. Use this instead of the generic hotkey tool "
+        "whenever the user wants to switch/cycle a browser tab — hotkey "
+        "would send Ctrl+Tab to whatever window the OS currently has "
+        "focused, which may not be the browser at all."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "direction": {
+                "type": "string",
+                "enum": ["next", "previous", "right", "left"],
+                "description": "Direction to cycle the active tab.",
+            },
+            "browser": {"type": "string", "description": "Optional: 'chrome' or 'edge' to restrict the search."},
+        },
+        "required": ["direction"],
     },
     risk="safe",
 )

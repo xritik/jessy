@@ -29,12 +29,15 @@ from core.app_paths import (
 )
 from core.registry import registry
 from core.result import CapabilityResult
+from core.window_focus import force_activate_window
 
 _user32 = ctypes.windll.user32
 _kernel32 = ctypes.windll.kernel32
 
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _SW_RESTORE = 9
+_SW_MINIMIZE = 6
+_SW_MAXIMIZE = 3
 _VK_MENU = 0x12
 _KEYEVENTF_KEYUP = 0x0002
 
@@ -204,6 +207,136 @@ def open_application(name: str, path: str | None = None) -> CapabilityResult:
     _bring_process_window_to_front({os.path.basename(resolved).lower()}, timeout=3.0)
     return CapabilityResult.ok("open_application", {"launched": resolved, "path": path})
 
+def _enum_windows() -> list[dict]:
+    """List every visible top-level window with a non-empty title."""
+    windows = []
+
+    def _callback(hwnd, _lparam):
+        if not _user32.IsWindowVisible(hwnd):
+            return True
+        length = _user32.GetWindowTextLengthW(hwnd)
+        if length == 0:
+            return True
+        buf = ctypes.create_unicode_buffer(length + 1)
+        _user32.GetWindowTextW(hwnd, buf, length + 1)
+        title = buf.value
+        if title.strip():
+            pid = wintypes.DWORD()
+            _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            windows.append({"hwnd": hwnd, "title": title, "pid": pid.value})
+        return True
+
+    _user32.EnumWindows(_EnumWindowsProc(_callback), 0)
+    return windows
+
+
+def _find_hwnd(title_contains: str) -> int | None:
+    needle = title_contains.lower()
+    for w in _enum_windows():
+        if needle in w["title"].lower():
+            return w["hwnd"]
+    return None
+
+
+def _resolve_hwnd(hwnd: int | None, title: str | None) -> tuple[int | None, str | None]:
+    """Returns (hwnd, error_message)."""
+    if hwnd:
+        if not _user32.IsWindow(hwnd):
+            return None, f"No window exists with hwnd {hwnd}."
+        return hwnd, None
+    if title:
+        found = _find_hwnd(title)
+        if found is None:
+            return None, f"No visible window found matching title '{title}'."
+        return found, None
+    return None, "Provide either hwnd or title."
+
+
+def list_windows() -> CapabilityResult:
+    """List all currently visible top-level windows with their titles, hwnd, and pid."""
+    try:
+        windows = _enum_windows()
+    except OSError as exc:
+        return CapabilityResult.fail("list_windows", f"Failed to enumerate windows: {exc}")
+    return CapabilityResult.ok("list_windows", {"windows": windows, "count": len(windows)})
+
+
+def get_active_window() -> CapabilityResult:
+    """Get the title, hwnd, and pid of the currently focused window."""
+    hwnd = _user32.GetForegroundWindow()
+    if not hwnd:
+        return CapabilityResult.fail("get_active_window", "No foreground window detected.")
+    length = _user32.GetWindowTextLengthW(hwnd)
+    buf = ctypes.create_unicode_buffer(length + 1)
+    _user32.GetWindowTextW(hwnd, buf, length + 1)
+    pid = wintypes.DWORD()
+    _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return CapabilityResult.ok("get_active_window", {
+        "hwnd": hwnd, "title": buf.value, "pid": pid.value,
+    })
+
+
+def focus_window(hwnd: int | None = None, title: str | None = None) -> CapabilityResult:
+    """Bring a window to the foreground, matched by hwnd or a substring of its title."""
+    resolved_hwnd, err = _resolve_hwnd(hwnd, title)
+    if err:
+        return CapabilityResult.fail("focus_window", err)
+    if not force_activate_window(resolved_hwnd):
+        return CapabilityResult.fail("focus_window", "Window did not become foreground.")
+    return CapabilityResult.ok("focus_window", {"hwnd": resolved_hwnd})
+
+
+def minimize_window(hwnd: int | None = None, title: str | None = None) -> CapabilityResult:
+    """Minimize a window matched by hwnd or title."""
+    resolved_hwnd, err = _resolve_hwnd(hwnd, title)
+    if err:
+        return CapabilityResult.fail("minimize_window", err)
+    _user32.ShowWindow(resolved_hwnd, _SW_MINIMIZE)
+    return CapabilityResult.ok("minimize_window", {"hwnd": resolved_hwnd})
+
+
+def maximize_window(hwnd: int | None = None, title: str | None = None) -> CapabilityResult:
+    """Maximize a window matched by hwnd or title."""
+    resolved_hwnd, err = _resolve_hwnd(hwnd, title)
+    if err:
+        return CapabilityResult.fail("maximize_window", err)
+    force_activate_window(resolved_hwnd)  # best-effort; not fatal if it fails
+    _user32.ShowWindow(resolved_hwnd, _SW_MAXIMIZE)
+    return CapabilityResult.ok("maximize_window", {"hwnd": resolved_hwnd})
+
+
+def close_window(hwnd: int | None = None, title: str | None = None) -> CapabilityResult:
+    """Close a window gracefully (posts WM_CLOSE) matched by hwnd or title."""
+    resolved_hwnd, err = _resolve_hwnd(hwnd, title)
+    if err:
+        return CapabilityResult.fail("close_window", err)
+    WM_CLOSE = 0x0010
+    _user32.PostMessageW(resolved_hwnd, WM_CLOSE, 0, 0)
+    return CapabilityResult.ok("close_window", {"hwnd": resolved_hwnd})
+
+
+def move_window(
+    x: int, y: int, width: int, height: int,
+    hwnd: int | None = None, title: str | None = None,
+) -> CapabilityResult:
+    """Move and/or resize a window matched by hwnd or title to (x, y, width, height)."""
+    resolved_hwnd, err = _resolve_hwnd(hwnd, title)
+    if err:
+        return CapabilityResult.fail("move_window", err)
+    SWP_NOZORDER = 0x0004
+    ok = _user32.SetWindowPos(resolved_hwnd, 0, x, y, width, height, SWP_NOZORDER)
+    if not ok:
+        return CapabilityResult.fail("move_window", "SetWindowPos failed.")
+    return CapabilityResult.ok("move_window", {
+        "hwnd": resolved_hwnd, "x": x, "y": y, "width": width, "height": height,
+    })
+
+
+def get_screen_size() -> CapabilityResult:
+    """Get the primary screen's resolution in pixels."""
+    width = _user32.GetSystemMetrics(0)
+    height = _user32.GetSystemMetrics(1)
+    return CapabilityResult.ok("get_screen_size", {"width": width, "height": height})
 
 registry.register(
     name="open_application",
@@ -232,5 +365,73 @@ registry.register(
         },
         "required": ["name"],
     },
+    risk="safe",
+)
+
+registry.register(
+    name="list_windows", function=list_windows,
+    description="List all visible top-level windows with their titles, hwnd, and pid.",
+    parameters={"type": "object", "properties": {}, "required": []},
+    risk="safe",
+)
+
+registry.register(
+    name="get_active_window", function=get_active_window,
+    description="Get the title, hwnd, and pid of the currently focused window.",
+    parameters={"type": "object", "properties": {}, "required": []},
+    risk="safe",
+)
+
+registry.register(
+    name="focus_window", function=focus_window,
+    description="Bring a window to the foreground, matched by hwnd or a substring of its title.",
+    parameters={"type": "object", "properties": {
+        "hwnd": {"type": ["integer", "null"]}, "title": {"type": ["string", "null"]},
+    }, "required": []},
+    risk="moderate",
+)
+
+registry.register(
+    name="minimize_window", function=minimize_window,
+    description="Minimize a window matched by hwnd or title.",
+    parameters={"type": "object", "properties": {
+        "hwnd": {"type": ["integer", "null"]}, "title": {"type": ["string", "null"]},
+    }, "required": []},
+    risk="moderate",
+)
+
+registry.register(
+    name="maximize_window", function=maximize_window,
+    description="Maximize a window matched by hwnd or title.",
+    parameters={"type": "object", "properties": {
+        "hwnd": {"type": ["integer", "null"]}, "title": {"type": ["string", "null"]},
+    }, "required": []},
+    risk="moderate",
+)
+
+registry.register(
+    name="close_window", function=close_window,
+    description="Close a window gracefully by posting WM_CLOSE, matched by hwnd or title.",
+    parameters={"type": "object", "properties": {
+        "hwnd": {"type": ["integer", "null"]}, "title": {"type": ["string", "null"]},
+    }, "required": []},
+    risk="high",
+)
+
+registry.register(
+    name="move_window", function=move_window,
+    description="Move and resize a window to a given position and size.",
+    parameters={"type": "object", "properties": {
+        "hwnd": {"type": ["integer", "null"]}, "title": {"type": ["string", "null"]},
+        "x": {"type": "integer"}, "y": {"type": "integer"},
+        "width": {"type": "integer"}, "height": {"type": "integer"},
+    }, "required": ["x", "y", "width", "height"]},
+    risk="moderate",
+)
+
+registry.register(
+    name="get_screen_size", function=get_screen_size,
+    description="Get the primary monitor's resolution in pixels.",
+    parameters={"type": "object", "properties": {}, "required": []},
     risk="safe",
 )

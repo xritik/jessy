@@ -266,6 +266,30 @@ def open_folder(path: str = "~") -> CapabilityResult:
     return CapabilityResult.ok("open_folder", {"path": resolved})
 
 
+def open_file_in_vscode(path: str) -> CapabilityResult:
+    """Open a specific file as a tab in the currently running VS Code
+    window (reuses the existing window via `code -r`, does not spawn a
+    new one). Call this after write_file/create_directory whenever the
+    user is working in VS Code and expects to actually see the file —
+    writing to disk alone does not open it as a tab."""
+    resolved = _resolve(path)
+
+    if not os.path.exists(resolved):
+        return CapabilityResult.fail("open_file_in_vscode", f"File does not exist: {resolved}")
+
+    code_cli = shutil.which("code") or shutil.which("code.cmd")
+    if not code_cli:
+        return CapabilityResult.fail("open_file_in_vscode", "VS Code CLI ('code') not found on PATH.")
+
+    try:
+        subprocess.Popen([code_cli, "-r", resolved])
+    except OSError as exc:
+        return CapabilityResult.fail("open_file_in_vscode", f"Failed to open file in VS Code: {exc}")
+
+    return CapabilityResult.ok("open_file_in_vscode", {"path": resolved})
+
+
+
 registry.register(
     name="list_directory",
     function=list_directory,
@@ -417,6 +441,26 @@ registry.register(
             "path": {"type": "string", "description": "Folder path to open. Defaults to the home directory ('~')."},
         },
         "required": [],
+    },
+    risk="safe",
+)
+
+registry.register(
+    name="open_file_in_vscode",
+    function=open_file_in_vscode,
+    description=(
+        "Open a specific file as a visible tab in the currently running "
+        "VS Code window. ALWAYS call this immediately after write_file "
+        "when the task involves VS Code (e.g. 'open X in VS Code and "
+        "create a file...') — write_file only writes to disk, it never "
+        "opens the file as a tab on its own."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path to the file to open in VS Code."},
+        },
+        "required": ["path"],
     },
     risk="safe",
 )

@@ -1,236 +1,275 @@
 """
-Thin wrapper around the Groq SDK.
+Groq API client wrapper for JESSY.
 
-Keeps model name, API keys, and call parameters centralized and
-environment-driven — never hardcoded. This is the ONLY place in the
-codebase that talks to Groq directly.
-
-Supports multiple API keys (GROQ_API_KEY_1, GROQ_API_KEY_2, ...) so that
-when one key hits its free-tier rate limit, calls automatically rotate
-to the next available key instead of failing the whole request. Once a
-key hits a limit it's put in "cooldown" for a while and skipped until
-that cooldown expires, then it becomes eligible again — cycling
-1 -> 2 -> ... -> N -> back to 1.
+Handles:
+    - Multiple API keys (ideally from separate Groq orgs), selected via
+      proactive round-robin so all available per-org rate limits are
+      used in parallel instead of hammering a single key until it 429s.
+    - Per (key, model) sliding-window RPM tracking: a key that is about
+      to breach its per-minute limit for a given model is skipped
+      *before* a request is sent, avoiding a wasted failed round-trip.
+    - Reactive 429 handling as a safety net: if a request is rate
+      limited anyway, that (key, model) pair is put into cooldown and
+      the request is retried on the next available key.
+    - A "main" model (higher quality, used for final answers) and a
+      "tool" model (smaller/faster, used for tool-routing decisions),
+      both configurable via environment variables.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
+from collections import deque
 from typing import Any, Optional
 
-from groq import Groq
-
-try:
-    from groq import RateLimitError
-except ImportError:  # pragma: no cover - safety net if SDK renames this
-    RateLimitError = None  # type: ignore[assignment]
+from groq import Groq, RateLimitError, APIStatusError
 
 logger = logging.getLogger("jessy.groq_client")
 
-# How long to keep a rate-limited key in "cooldown" before it's eligible
-# again. Groq free-tier limits are commonly per-minute/day; this is a
-# conservative default, and we shorten it automatically if the API
-# response includes a Retry-After header.
-_DEFAULT_COOLDOWN_SECONDS = 60 * 60  # 1 hour
+DEFAULT_RPM_LIMIT = 30            # Groq free-tier default, per model per org
+DEFAULT_COOLDOWN_SECONDS = 3600.0  # fallback cooldown if Retry-After is absent
+WINDOW_SECONDS = 60.0
 
 
-def _load_api_keys() -> list[str]:
-    """Collect all configured Groq API keys, in order.
-
-    Supports GROQ_API_KEY_1, GROQ_API_KEY_2, ... (preferred, enables
-    rotation) and falls back to a single GROQ_API_KEY for backward
-    compatibility with older .env files.
-    """
-    keys: list[str] = []
-    i = 1
-    while True:
-        key = os.getenv(f"GROQ_API_KEY_{i}")
-        if key is None:
-            break
-        if key and key != "your_key_here":
-            keys.append(key)
-        i += 1
-
-    if not keys:
-        single = os.getenv("GROQ_API_KEY")
-        if single and single != "your_key_here":
-            keys.append(single)
-
-    return keys
+def _mask_key(key: str) -> str:
+    if len(key) <= 12:
+        return "****"
+    return f"{key[:8]}...{key[-4:]}"
 
 
-def _is_rate_limit_error(exc: Exception) -> bool:
-    """Detect a 429 rate-limit error robustly, even if the SDK's
-    exception class changes name between versions."""
-    if RateLimitError is not None and isinstance(exc, RateLimitError):
-        return True
-    status_code = getattr(exc, "status_code", None)
-    if status_code == 429:
-        return True
-    response = getattr(exc, "response", None)
-    if response is not None and getattr(response, "status_code", None) == 429:
-        return True
-    return False
+class _KeyState:
+    """Tracks rate-limit bookkeeping and the Groq client for a single API key."""
 
+    def __init__(self, api_key: str) -> None:
+        self.api_key = api_key
+        self.masked = _mask_key(api_key)
+        self.client = Groq(api_key=api_key)
+        # call_times[model] -> deque of monotonic timestamps within the window
+        self.call_times: dict[str, deque[float]] = {}
+        # cooldown_until[model] -> monotonic time after which this key is
+        # usable again for that model (absent/0.0 means not in cooldown)
+        self.cooldown_until: dict[str, float] = {}
+        self.lock = threading.Lock()
 
-def _extract_retry_after(exc: Exception) -> Optional[float]:
-    """Best-effort extraction of a Retry-After hint from the
-    exception's HTTP response, if the SDK exposes it."""
-    response = getattr(exc, "response", None)
-    headers = getattr(response, "headers", None) if response else None
-    if not headers:
-        return None
-    value = headers.get("retry-after") or headers.get("Retry-After")
-    try:
-        return float(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
+    def _prune(self, model: str, now: float) -> deque[float]:
+        dq = self.call_times.setdefault(model, deque())
+        while dq and now - dq[0] > WINDOW_SECONDS:
+            dq.popleft()
+        return dq
+
+    def is_available(self, model: str, rpm_limit: int, now: float) -> bool:
+        with self.lock:
+            cooldown = self.cooldown_until.get(model, 0.0)
+            if cooldown > now:
+                return False
+            dq = self._prune(model, now)
+            return len(dq) < rpm_limit
+
+    def record_call(self, model: str, now: float) -> None:
+        with self.lock:
+            dq = self.call_times.setdefault(model, deque())
+            dq.append(now)
+
+    def set_cooldown(self, model: str, seconds: float) -> None:
+        with self.lock:
+            self.cooldown_until[model] = time.monotonic() + seconds
+
+    def cooldown_remaining(self, model: str, now: float) -> float:
+        with self.lock:
+            return max(0.0, self.cooldown_until.get(model, 0.0) - now)
 
 
 class GroqClient:
-    """Wraps the Groq SDK for chat completions with tool calling.
-
-    Rotates across multiple API keys when one is rate-limited (HTTP
-    429), so a single exhausted free-tier key doesn't take the whole
-    assistant down. Only 429s trigger rotation — other errors (bad
-    request, network issue, etc.) still fail immediately as before.
+    """
+    Wraps one or more Groq API keys (ideally from separate orgs) behind
+    a single interface, with proactive round-robin key selection and
+    per-(key, model) rate-limit tracking.
     """
 
-    def __init__(self) -> None:
-        self._keys = _load_api_keys()
-        if not self._keys:
+    def __init__(
+        self,
+        api_keys: Optional[list[str]] = None,
+        model: Optional[str] = None,
+        tool_model: Optional[str] = None,
+        rpm_limit: Optional[int] = None,
+    ) -> None:
+        keys = api_keys or self._load_keys_from_env()
+        if not keys:
             raise RuntimeError(
-                "No Groq API key found. Add GROQ_API_KEY_1 (and "
-                "optionally _2, _3, ...) to backend/.env"
+                "No Groq API keys configured. Set GROQ_API_KEY or "
+                "GROQ_API_KEY_1..N in the environment."
             )
 
-        self.model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+        self.model = model or os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+        self.tool_model = tool_model or os.getenv("GROQ_TOOL_MODEL", "openai/gpt-oss-20b")
+        self.rpm_limit = rpm_limit or int(os.getenv("GROQ_RPM_LIMIT", str(DEFAULT_RPM_LIMIT)))
 
-        # Per-key cooldown-until timestamp (monotonic seconds). 0 means
-        # "not in cooldown, available right now".
-        self._cooldown_until: dict[int, float] = {i: 0.0 for i in range(len(self._keys))}
-        self._current_index = 0
-        self._client = Groq(api_key=self._keys[self._current_index])
+        self._keys = [_KeyState(k) for k in keys]
+        self._num_keys = len(self._keys)
+        self._rr_index = 0  # round-robin pointer, shared across all requests
+        self._rr_lock = threading.Lock()
 
         logger.info(
-            "GroqClient initialized with model=%s, %d key(s) available",
+            "GroqClient initialized with model=%s, tool_model=%s, %s key(s) available "
+            "(rpm_limit=%s per key per model)",
             self.model,
-            len(self._keys),
+            self.tool_model,
+            self._num_keys,
+            self.rpm_limit,
         )
 
     @staticmethod
-    def _mask(key: str) -> str:
-        return f"{key[:8]}...{key[-4:]}" if len(key) > 12 else "***"
+    def _load_keys_from_env() -> list[str]:
+        keys: list[str] = []
+        single = os.getenv("GROQ_API_KEY")
+        if single:
+            keys.append(single)
+        i = 1
+        while True:
+            k = os.getenv(f"GROQ_API_KEY_{i}")
+            if not k:
+                break
+            keys.append(k)
+            i += 1
+        seen: set[str] = set()
+        unique: list[str] = []
+        for k in keys:
+            if k not in seen:
+                seen.add(k)
+                unique.append(k)
+        return unique
 
-    def _switch_to(self, index: int) -> None:
-        self._current_index = index
-        self._client = Groq(api_key=self._keys[index])
+    def _next_round_robin_start(self) -> int:
+        with self._rr_lock:
+            start = self._rr_index
+            self._rr_index = (self._rr_index + 1) % self._num_keys
+            return start
 
-    def _mark_rate_limited(self, index: int, retry_after: Optional[float]) -> None:
-        cooldown = retry_after if retry_after and retry_after > 0 else _DEFAULT_COOLDOWN_SECONDS
-        self._cooldown_until[index] = time.monotonic() + cooldown
-        logger.warning(
-            "Groq key #%d (%s) hit rate limit; cooling down for %.0fs",
-            index + 1,
-            self._mask(self._keys[index]),
-            cooldown,
-        )
-
-    def _next_available_index(self, exclude: set[int]) -> Optional[int]:
-        """Next key not currently in cooldown and not already tried this
-        call, cycling forward from the current index and wrapping
-        around (N -> back to 1). Returns None if none are available."""
+    def _pick_key_order(self, model: str) -> list[int]:
+        """
+        Order key indices to try: start from the next round-robin slot
+        (spreading load evenly), prioritize keys with proactive RPM
+        headroom for this model, then fall back to all remaining keys
+        in rotation order even if they look unavailable, so a request
+        is still attempted rather than failing before hitting the
+        network at all.
+        """
         now = time.monotonic()
-        n = len(self._keys)
-        for step in range(1, n + 1):
-            idx = (self._current_index + step) % n
-            if idx in exclude:
-                continue
-            if self._cooldown_until[idx] <= now:
-                return idx
-        return None
+        start = self._next_round_robin_start()
+        ordered = [(start + i) % self._num_keys for i in range(self._num_keys)]
+
+        available = [i for i in ordered if self._keys[i].is_available(model, self.rpm_limit, now)]
+        unavailable = [i for i in ordered if i not in available]
+        return available + unavailable
 
     def chat(
         self,
         messages: list[dict[str, Any]],
         tools: Optional[list[dict[str, Any]]] = None,
-        tool_choice: str = "auto",
-        temperature: float = 0.3,
+        tool_choice: Optional[str] = None,
+        model: Optional[str] = None,
+        **kwargs: Any,
     ) -> Any:
         """
-        Send a chat completion request to Groq.
-
-        Automatically rotates to the next available (non-rate-limited)
-        key if the current one returns a 429, retrying the SAME request
-        transparently. Tries each key at most once per call; if every
-        key is currently rate-limited, raises one clean error instead
-        of a raw stack trace.
-
-        Returns the raw SDK response object. Callers inspect
-        `response.choices[0].message` for content and/or tool_calls.
+        Send a chat completion request, proactively selecting a key that
+        has RPM headroom for the requested model, and falling back to
+        reactive 429 handling (cooldown + retry on the next key) if the
+        proactive check turns out to be wrong.
         """
-        kwargs: dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": temperature,
-        }
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = tool_choice
+        use_model = model or self.model
+        key_order = self._pick_key_order(use_model)
 
-        tried: set[int] = set()
-        n = len(self._keys)
+        last_error: Optional[Exception] = None
 
-        for _ in range(n):
-            if self._cooldown_until[self._current_index] > time.monotonic():
-                next_idx = self._next_available_index(tried)
-                if next_idx is None:
-                    break
-                self._switch_to(next_idx)
+        for position, key_index in enumerate(key_order):
+            key_state = self._keys[key_index]
+            now = time.monotonic()
+            is_last_option = position == len(key_order) - 1
 
-            tried.add(self._current_index)
+            if not key_state.is_available(use_model, self.rpm_limit, now) and not is_last_option:
+                # Still cooling down or already at its RPM budget for this
+                # model; skip without spending a network round-trip.
+                continue
 
             logger.info(
-                "Using Groq key #%d (%s) for this request",
-                self._current_index + 1,
-                self._mask(self._keys[self._current_index]),
+                "Using Groq key #%s (%s) for this request [model=%s]",
+                key_index + 1,
+                key_state.masked,
+                use_model,
             )
 
+            request_kwargs: dict[str, Any] = {
+                "model": use_model,
+                "messages": messages,
+                **kwargs,
+            }
+            if tools:
+                request_kwargs["tools"] = tools
+            if tool_choice:
+                request_kwargs["tool_choice"] = tool_choice
+
             try:
-                return self._client.chat.completions.create(**kwargs)
-            except Exception as exc:
-                if not _is_rate_limit_error(exc):
-                    logger.exception("Groq API call failed")
-                    raise RuntimeError(f"Groq API call failed: {exc}") from exc
+                response = key_state.client.chat.completions.create(**request_kwargs)
+                key_state.record_call(use_model, time.monotonic())
+                return response
 
-                self._mark_rate_limited(self._current_index, _extract_retry_after(exc))
-
-                next_idx = self._next_available_index(tried)
-                if next_idx is None:
-                    break
-                logger.info(
-                    "Switching from Groq key #%d to key #%d",
-                    self._current_index + 1,
-                    next_idx + 1,
+            except RateLimitError as exc:
+                last_error = exc
+                cooldown_seconds = self._extract_retry_after(exc) or DEFAULT_COOLDOWN_SECONDS
+                key_state.set_cooldown(use_model, cooldown_seconds)
+                logger.warning(
+                    "Groq key #%s (%s) hit rate limit; cooling down for %ss",
+                    key_index + 1,
+                    key_state.masked,
+                    int(cooldown_seconds),
                 )
-                self._switch_to(next_idx)
+                if not is_last_option:
+                    next_key_index = key_order[position + 1]
+                    logger.info(
+                        "Switching from Groq key #%s to key #%s",
+                        key_index + 1,
+                        next_key_index + 1,
+                    )
+                continue
 
-        logger.error("All %d Groq API key(s) are currently rate-limited", n)
+            except APIStatusError:
+                # Non-rate-limit API error: don't rotate keys for this,
+                # just raise it upward as-is.
+                raise
+
         raise RuntimeError(
             "All Groq API keys have hit their rate limit. Please try again later."
-        )
+        ) from last_error
+
+    @staticmethod
+    def _extract_retry_after(exc: RateLimitError) -> Optional[float]:
+        """Pull the Retry-After value (seconds) from a 429 response, if present."""
+        try:
+            headers = getattr(exc.response, "headers", None) or {}
+            retry_after = headers.get("retry-after")
+            if retry_after is not None:
+                return float(retry_after)
+        except Exception:
+            logger.debug("Could not parse Retry-After header from 429 response", exc_info=True)
+        return None
+
+# --- Singleton accessor -----------------------------------------------
+
+_client_instance: Optional["GroqClient"] = None
+_client_lock = threading.Lock()
 
 
-# Lazily created singleton — instantiated on first use so importing this
-# module never fails just because .env isn't loaded yet at import time.
-_groq_client_instance: Optional[GroqClient] = None
-
-
-def get_groq_client() -> GroqClient:
-    """Return the shared GroqClient instance, creating it if needed."""
-    global _groq_client_instance
-    if _groq_client_instance is None:
-        _groq_client_instance = GroqClient()
-    return _groq_client_instance
+def get_groq_client() -> "GroqClient":
+    """
+    Return a process-wide singleton GroqClient instance, creating it on
+    first call using configuration from environment variables.
+    """
+    global _client_instance
+    if _client_instance is None:
+        with _client_lock:
+            if _client_instance is None:
+                _client_instance = GroqClient()
+    return _client_instance

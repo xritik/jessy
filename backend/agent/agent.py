@@ -10,6 +10,16 @@ This is the heart of JESSY described in the master architecture:
 The agent never executes model-generated code. It only ever calls
 capabilities that exist in the CapabilityRegistry, through the
 Executor.
+
+Model split:
+    - Tool-routing / argument-extraction steps (deciding which
+      capability to call and with what arguments) use
+      groq_client.tool_model — a smaller/faster model, since this is
+      a simpler decision task and happens on every step of the loop.
+    - Once the model decides no more tools are needed, a final
+      dedicated call is made using groq_client.model (the larger,
+      higher-quality model) with tools disabled, purely to produce
+      the natural-language answer shown to the user.
 """
 
 from __future__ import annotations
@@ -49,7 +59,45 @@ whenever the user names one, so tab-vs-window is handled correctly. Only \
 set new_window=true if the user explicitly wants a separate new window \
 rather than a tab.
 - If no specific site is mentioned for open_url, default to google.com.
+- To switch/cycle to the next or previous browser tab (e.g. "switch the \
+chrome tab to the right/left", "go to the next tab"), use \
+switch_tab_direction with browser set to the named browser. Do NOT use \
+hotkey for this — hotkey sends input to whatever window currently has \
+OS focus, which may not be the browser at all.
+- To navigate the CURRENTLY ACTIVE tab to a new page after switching tabs \
+or otherwise (e.g. "search canva.com there"), use navigate_active_tab \
+with the same browser specified, so it acts on the correct window.
 
+Editor and file behavior:
+- By default, when the user asks to create a NEW file or NEW folder, do \
+it VISIBLY: use create_folder_visual for new folders and \
+create_file_visual_in_vscode for new files, so the user actually watches \
+Explorer/VS Code perform the action on screen. Only use the silent \
+write_file/create_directory tools when the user explicitly asks for it \
+to happen in the background, silently, or without opening any window.
+- If the user does not specify a folder/location for a new file or \
+folder, default to the Desktop ('~/Desktop').
+- create_folder_visual and create_file_visual_in_vscode already open the \
+correct window (Explorer or VS Code) themselves as part of the visible \
+flow. Do not call open_application or open_folder separately beforehand.
+- write_file only writes bytes to disk and never opens the file as a \
+visible tab, even if VS Code is already open. If you use write_file \
+(because the user explicitly wanted it silent) for a task that involves \
+VS Code, you MUST call open_file_in_vscode with that same path \
+immediately after write_file succeeds, so the user actually sees the \
+file open, not just present in the Explorer sidebar.
+- If the user asks to open a folder in VS Code, use open_application or \
+whatever capability launches VS Code on that folder first. Do not assume \
+opening the folder also opens or focuses any particular file inside it.
+
+Focus and window targeting:
+- The generic hotkey and press_key tools send input to whatever window \
+currently has OS-level focus, NOT necessarily the application named in \
+the user's request. Before using hotkey/press_key to act on a specific \
+named application, make sure a dedicated, focus-safe tool for that action \
+exists and is preferred (e.g. switch_tab_direction for browser tabs). \
+Only fall back to hotkey/press_key/type_text for generic actions on \
+whatever window the user is already actively using right now.
 
 Rules:
 - Only use the tools provided to you. Never claim to have done something \
@@ -61,8 +109,6 @@ guessing.
 - Once you have enough information and no more tools are needed, respond \
 with a final, natural-language answer summarizing what actually happened.
 """
-
-
 
 class Agent:
     """Runs the multi-step tool-calling loop for a single user request."""
@@ -117,7 +163,13 @@ class Agent:
         for step in range(1, self.max_steps + 1):
             emit("agent_thinking", {"step": step})
 
-            response = self.groq_client.chat(messages=messages, tools=tools or None)
+            # Tool-routing step: use the smaller/faster model since this
+            # is just deciding which capability (if any) to call next.
+            response = self.groq_client.chat(
+                messages=messages,
+                tools=tools or None,
+                model=self.groq_client.tool_model,
+            )
             choice = response.choices[0].message
 
             # Groq wants to call one or more tools.
@@ -171,8 +223,15 @@ class Agent:
                 # decide the next action or produce a final answer.
                 continue
 
-            # No tool calls: Groq has produced a final answer.
-            final_text = choice.content or ""
+            # No tool calls: the tool-routing model decided it's done.
+            # Make one dedicated call with the higher-quality model (no
+            # tools) to produce the polished final answer the user sees.
+            final_response = self.groq_client.chat(
+                messages=messages,
+                model=self.groq_client.model,
+            )
+            final_text = final_response.choices[0].message.content or ""
+
             step_logs.append(
                 AgentStepLog(step_number=step, note="final_answer")
             )
