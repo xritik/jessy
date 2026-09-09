@@ -80,6 +80,21 @@ False-completion guard:
       level backstop that checks step_logs before letting such a claim
       through in the final answer.
 
+Working context and action history (Phase 8):
+    - Each session has a WorkingContext (agent/context.py) tracking the
+      "current file / folder / project / application / browser / tab"
+      JESSY has touched, updated after every capability call. A short
+      plain-text summary of it is injected as an extra system message
+      before the user's message — but only when there's something worth
+      mentioning — so references like "open it" or "run it" resolve
+      correctly without repeating full paths every turn.
+    - Every capability attempt (executed, failed, proposed for
+      confirmation, or cancelled by the user) is also recorded into the
+      global, cross-session action log (core/action_log.py), which
+      backs the GET /actions endpoint and, later, the GUI's Action Feed.
+      This never affects what's sent to Groq — it's purely an audit
+      trail for the user/GUI.
+
 IMPORTANT — process model requirement:
     `_pending_confirmations` below is a plain in-memory dict living at
     module scope. It is only reliable if this app runs as a SINGLE
@@ -90,7 +105,8 @@ IMPORTANT — process model requirement:
     different worker. Likewise, `--reload` restarting the process
     between two requests wipes this dict. Run with a single worker and
     no reload for this design to behave correctly, or move this state
-    to a shared store (e.g. Redis) if you need multiple workers.
+    to a shared store (e.g. Redis) if you need multiple workers. The
+    same applies to agent/context.py's per-session store.
 """
 
 from __future__ import annotations
@@ -101,10 +117,12 @@ import os
 import re
 from typing import Any, Callable, Optional
 
+from agent.context import WorkingContext, get_context
 from core.executor import Executor
 from core.groq_client import GroqClient
 from core.registry import CapabilityRegistry
 from core.result import AgentStepLog, CapabilityResult, RiskLevel
+from core import action_log
 
 logger = logging.getLogger("jessy.agent")
 
@@ -358,13 +376,12 @@ class Agent:
         Run the agent loop for a single user message.
 
         history: prior conversation turns (role/content dicts), excluding
-                 the system prompt — kept short by the caller (Phase 8
-                 Memory/Context will manage this properly).
+                 the system prompt — kept short by core/memory.py.
         on_event: optional callback(event_type, payload) for real-time
                   GUI events (wired to WebSocket in Phase 10). Safe to
                   leave as None for now.
         session_id: identifies the conversation, used to track a pending
-                    confirmation (if any) across turns.
+                    confirmation and working context across turns.
 
         Returns (final_response_text, step_logs).
         """
@@ -375,6 +392,11 @@ class Agent:
                     on_event(event_type, payload)
                 except Exception:
                     logger.exception("on_event callback failed for %s", event_type)
+
+        # Phase 8: this session's Working Context — updated after every
+        # capability call below, used to build a short summary that gets
+        # injected into the messages sent to Groq.
+        working_context: WorkingContext = get_context(session_id)
 
         # --- Resolve a pending confirmation directly, with no model call ---
         pending = _pending_confirmations.get(session_id)
@@ -410,6 +432,11 @@ class Agent:
                 else:
                     emit("capability_failed", {"capability": cap_name, "error": result.error})
 
+                # Phase 8: reflect this confirmed action in working context
+                # and the global action log, same as any other execution.
+                working_context.update_from_result(cap_name, cap_args, result)
+                action_log.record(cap_name, cap_args, result, session_id=session_id)
+
                 final_text = self._describe_confirmed_result(cap_name, cap_args, result)
                 step_log = AgentStepLog(
                     step_number=1, capability=cap_name, arguments=cap_args, result=result
@@ -419,6 +446,18 @@ class Agent:
 
             if _NEGATIVE_PATTERN.match(normalized_message):
                 _pending_confirmations.pop(session_id, None)
+
+                # Phase 8: record that the user declined, so the action
+                # feed shows this was proposed and then cancelled rather
+                # than just silently vanishing.
+                action_log.record(
+                    pending["capability"],
+                    pending["arguments"],
+                    result=None,
+                    session_id=session_id,
+                    status_override="cancelled",
+                )
+
                 final_text = "Okay, I won't do that. Let me know if you'd like something else."
                 emit("agent_completed", {"response": final_text})
                 return final_text, [AgentStepLog(step_number=1, note="confirmation_declined")]
@@ -429,6 +468,14 @@ class Agent:
             _pending_confirmations.pop(session_id, None)
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+        # Phase 8: inject a short working-context summary, but only if
+        # there's actually something worth mentioning (keeps brand-new
+        # sessions free of empty boilerplate).
+        context_summary = working_context.as_prompt_context()
+        if context_summary:
+            messages.append({"role": "system", "content": context_summary})
+
         if history:
             messages.extend(history)
         messages.append({"role": "user", "content": user_message})
@@ -476,6 +523,7 @@ class Agent:
                     if placeholder:
                         result = CapabilityResult(
                             success=False,
+                            action=cap_name,
                             error=(
                                 f"Argument contains an unresolved placeholder "
                                 f"'{placeholder}'. Use '~' for the home "
@@ -524,6 +572,16 @@ class Agent:
                                 session_id, cap_name, cap_args,
                             )
 
+                            # Phase 8: log this as "proposed" (not executed,
+                            # not failed) and record the attempt in working
+                            # context's recent_actions, without touching any
+                            # "current X" slot since nothing actually ran.
+                            working_context.update_from_result(cap_name, cap_args, result)
+                            action_log.record(
+                                cap_name, cap_args, result,
+                                session_id=session_id, status_override="proposed",
+                            )
+
                             step_logs.append(
                                 AgentStepLog(
                                     step_number=step,
@@ -538,6 +596,12 @@ class Agent:
                             )
                             emit("agent_completed", {"response": confirmation_question})
                             return confirmation_question, step_logs
+
+                    # Phase 8: reflect this call in working context and the
+                    # global action log. Runs for every non-confirmation-
+                    # required outcome above (both success and failure).
+                    working_context.update_from_result(cap_name, cap_args, result)
+                    action_log.record(cap_name, cap_args, result, session_id=session_id)
 
                     step_logs.append(
                         AgentStepLog(

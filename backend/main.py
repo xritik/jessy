@@ -1,8 +1,10 @@
 """
 JESSY Backend — Entry Point
 
-Step 2: Wires the Core Agent (Groq client, Capability Registry,
-Executor, Agent loop) into a real /chat endpoint.
+Phase 8: Wires Working Context (agent/context.py) and the global
+Action History (core/action_log.py) in via two new read-only endpoints
+used to verify context/memory behavior — GET /actions and
+GET /debug/context/{session_id}.
 """
 
 import logging
@@ -27,7 +29,9 @@ import capabilities  # noqa: E402,F401
 from core.executor import Executor  # noqa: E402
 from core.groq_client import get_groq_client  # noqa: E402
 from core.registry import registry  # noqa: E402
+from core import action_log  # noqa: E402
 from agent.agent import Agent  # noqa: E402
+from agent.context import get_context as get_working_context  # noqa: E402
 
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
 
@@ -93,6 +97,25 @@ def debug_spawn_test():
         "session_name": _os.environ.get("SESSIONNAME"),
     }
 # -------------------------------------------------------------------------
+
+
+# --- TEMPORARY DEBUG ROUTE — inspect a session's Working Context (Phase 8) ---
+@app.get("/debug/context/{session_id}", tags=["debug"])
+def debug_context(session_id: str):
+    return get_working_context(session_id).to_dict()
+# -------------------------------------------------------------------------
+
+
+@app.get("/actions", tags=["agent"])
+async def get_actions(limit: int = 10):
+    """
+    Return the most recent capability actions across all sessions, for
+    the future Action Feed (Phase 11). Statuses: executed / proposed /
+    failed / cancelled. Never fabricated — this reads straight from
+    core/action_log.py, which is only ever written to by the Agent
+    loop right after a real Executor call (or a real user decision).
+    """
+    return {"actions": action_log.get_recent(limit=limit)}
 
 
 # Friendly, user-facing message shown whenever the agent fails to run at
