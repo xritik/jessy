@@ -95,6 +95,20 @@ Working context and action history (Phase 8):
       This never affects what's sent to Groq — it's purely an audit
       trail for the user/GUI.
 
+Voice state (Phase 9.4):
+    - Every call to run() flips this session's voice state (voice/
+      state.py) to THINKING for the duration of the loop, and reliably
+      back to IDLE afterward — via try/finally, so this happens on
+      every exit path (a resolved confirmation, a confirmation question,
+      a final answer, the max-steps fallback, or an unexpected
+      exception) without needing a reset before each individual return
+      statement. main.py's /voice endpoint additionally sets LISTENING
+      before transcription and SPEAKING during TTS, around this call;
+      /chat has no LISTENING/SPEAKING phases, so its sessions simply go
+      idle -> thinking -> idle. This lays the groundwork for Phase 10,
+      where a WebSocket will push these same transitions to the GUI
+      live instead of only being visible via the debug endpoint or logs.
+
 IMPORTANT — process model requirement:
     `_pending_confirmations` below is a plain in-memory dict living at
     module scope. It is only reliable if this app runs as a SINGLE
@@ -106,7 +120,8 @@ IMPORTANT — process model requirement:
     between two requests wipes this dict. Run with a single worker and
     no reload for this design to behave correctly, or move this state
     to a shared store (e.g. Redis) if you need multiple workers. The
-    same applies to agent/context.py's per-session store.
+    same applies to agent/context.py's per-session store and
+    voice/state.py's per-session store.
 """
 
 from __future__ import annotations
@@ -123,6 +138,7 @@ from core.groq_client import GroqClient
 from core.registry import CapabilityRegistry
 from core.result import AgentStepLog, CapabilityResult, RiskLevel
 from core import action_log
+from voice.state import VoiceState, set_state as set_voice_state
 
 logger = logging.getLogger("jessy.agent")
 
@@ -384,6 +400,11 @@ class Agent:
                     confirmation and working context across turns.
 
         Returns (final_response_text, step_logs).
+
+        Voice state (Phase 9.4): this session's voice state is set to
+        THINKING for the duration of the call and reliably reset to
+        IDLE afterward via try/finally, no matter which of the several
+        return points below is hit, or whether an exception escapes.
         """
 
         def emit(event_type: str, payload: dict[str, Any]) -> None:
@@ -398,297 +419,301 @@ class Agent:
         # injected into the messages sent to Groq.
         working_context: WorkingContext = get_context(session_id)
 
-        # --- Resolve a pending confirmation directly, with no model call ---
-        pending = _pending_confirmations.get(session_id)
-        normalized_message = _normalize_reply(user_message)
+        set_voice_state(session_id, VoiceState.THINKING)
+        try:
+            # --- Resolve a pending confirmation directly, with no model call ---
+            pending = _pending_confirmations.get(session_id)
+            normalized_message = _normalize_reply(user_message)
 
-        logger.info(
-            "run() session=%s message=%r normalized=%r pending=%s",
-            session_id, user_message, normalized_message, pending,
-        )
-
-        if pending is not None:
-            if _AFFIRMATIVE_PATTERN.match(normalized_message):
-                _pending_confirmations.pop(session_id, None)
-                cap_name = pending["capability"]
-                cap_args = dict(pending["arguments"])
-
-                # A user's "yes" to a confirmation-required action also
-                # satisfies that capability's own internal overwrite
-                # guard (e.g. write_file's "file already exists" check),
-                # which confirmed=True on the Executor does NOT bypass on
-                # its own — that flag only skips the SafetyLayer risk
-                # check. Only inject it for capabilities verified to
-                # accept this kwarg, to avoid an "Invalid arguments" error
-                # from the Executor's signature check.
-                if cap_name in _OVERWRITE_CAPABLE_CAPABILITIES:
-                    cap_args["overwrite"] = True
-
-                emit("capability_started", {"capability": cap_name, "arguments": cap_args})
-                result = self.executor.execute(cap_name, cap_args, confirmed=True)
-
-                if result.success:
-                    emit("capability_completed", {"capability": cap_name, "data": result.data})
-                else:
-                    emit("capability_failed", {"capability": cap_name, "error": result.error})
-
-                # Phase 8: reflect this confirmed action in working context
-                # and the global action log, same as any other execution.
-                working_context.update_from_result(cap_name, cap_args, result)
-                action_log.record(cap_name, cap_args, result, session_id=session_id)
-
-                final_text = self._describe_confirmed_result(cap_name, cap_args, result)
-                step_log = AgentStepLog(
-                    step_number=1, capability=cap_name, arguments=cap_args, result=result
-                )
-                emit("agent_completed", {"response": final_text})
-                return final_text, [step_log]
-
-            if _NEGATIVE_PATTERN.match(normalized_message):
-                _pending_confirmations.pop(session_id, None)
-
-                # Phase 8: record that the user declined, so the action
-                # feed shows this was proposed and then cancelled rather
-                # than just silently vanishing.
-                action_log.record(
-                    pending["capability"],
-                    pending["arguments"],
-                    result=None,
-                    session_id=session_id,
-                    status_override="cancelled",
-                )
-
-                final_text = "Okay, I won't do that. Let me know if you'd like something else."
-                emit("agent_completed", {"response": final_text})
-                return final_text, [AgentStepLog(step_number=1, note="confirmation_declined")]
-
-            # Not a recognizable yes/no — drop the stale pending
-            # confirmation and fall through to handle this as a normal,
-            # unrelated new message.
-            _pending_confirmations.pop(session_id, None)
-
-        messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-        # Phase 8: inject a short working-context summary, but only if
-        # there's actually something worth mentioning (keeps brand-new
-        # sessions free of empty boilerplate).
-        context_summary = working_context.as_prompt_context()
-        if context_summary:
-            messages.append({"role": "system", "content": context_summary})
-
-        if history:
-            messages.extend(history)
-        messages.append({"role": "user", "content": user_message})
-
-        tools = self.registry.to_groq_tools()
-        step_logs: list[AgentStepLog] = []
-
-        emit("agent_started", {"message": user_message})
-
-        for step in range(1, self.max_steps + 1):
-            emit("agent_thinking", {"step": step})
-
-            # Tool-routing step: use the smaller/faster model since this
-            # is just deciding which capability (if any) to call next.
-            response = self.groq_client.chat(
-                messages=messages,
-                tools=tools or None,
-                model=self.groq_client.tool_model,
+            logger.info(
+                "run() session=%s message=%r normalized=%r pending=%s",
+                session_id, user_message, normalized_message, pending,
             )
-            choice = response.choices[0].message
 
-            # Groq wants to call one or more tools.
-            if getattr(choice, "tool_calls", None):
-                messages.append(choice)
+            if pending is not None:
+                if _AFFIRMATIVE_PATTERN.match(normalized_message):
+                    _pending_confirmations.pop(session_id, None)
+                    cap_name = pending["capability"]
+                    cap_args = dict(pending["arguments"])
 
-                for tool_call in choice.tool_calls:
-                    cap_name = tool_call.function.name
-                    try:
-                        cap_args = json.loads(tool_call.function.arguments or "{}")
-                    except json.JSONDecodeError:
-                        cap_args = {}
+                    # A user's "yes" to a confirmation-required action also
+                    # satisfies that capability's own internal overwrite
+                    # guard (e.g. write_file's "file already exists" check),
+                    # which confirmed=True on the Executor does NOT bypass on
+                    # its own — that flag only skips the SafetyLayer risk
+                    # check. Only inject it for capabilities verified to
+                    # accept this kwarg, to avoid an "Invalid arguments" error
+                    # from the Executor's signature check.
+                    if cap_name in _OVERWRITE_CAPABLE_CAPABILITIES:
+                        cap_args["overwrite"] = True
 
-                    emit(
-                        "capability_started",
-                        {"capability": cap_name, "arguments": cap_args},
-                    )
-
-                    # Guard against the model hallucinating a literal,
-                    # unresolved placeholder (e.g. "<username>") inside an
-                    # argument such as a filesystem path. Executing that
-                    # directly produces a cryptic OSError deep in the
-                    # Executor; catching it here gives a clear, actionable
-                    # error instead and avoids ever hitting the filesystem.
-                    placeholder = _find_placeholder(cap_args)
-                    if placeholder:
-                        result = CapabilityResult(
-                            success=False,
-                            action=cap_name,
-                            error=(
-                                f"Argument contains an unresolved placeholder "
-                                f"'{placeholder}'. Use '~' for the home "
-                                f"directory, or the exact path from a previous "
-                                f"tool result, instead of a template value."
-                            ),
-                        )
-                        logger.warning(
-                            "Blocked tool call %s for session %s: placeholder "
-                            "%s found in arguments %s",
-                            cap_name, session_id, placeholder, cap_args,
-                        )
-                    else:
-                        result = self.executor.execute(cap_name, cap_args)
+                    emit("capability_started", {"capability": cap_name, "arguments": cap_args})
+                    result = self.executor.execute(cap_name, cap_args, confirmed=True)
 
                     if result.success:
-                        emit(
-                            "capability_completed",
-                            {"capability": cap_name, "data": result.data},
-                        )
+                        emit("capability_completed", {"capability": cap_name, "data": result.data})
                     else:
-                        emit(
-                            "capability_failed",
-                            {"capability": cap_name, "error": result.error},
-                        )
+                        emit("capability_failed", {"capability": cap_name, "error": result.error})
 
-                        # If this failure is specifically because the
-                        # action needs user confirmation, stop the loop
-                        # here and now. We store the pending confirmation
-                        # for this session and return a deterministic,
-                        # code-generated question immediately — we do NOT
-                        # let the model see this tool result and try to
-                        # phrase its own question. That extra model
-                        # round-trip was the source of garbled/duplicated
-                        # confirmation text (the model sometimes needed
-                        # 2-4 more steps to "settle" on a final answer,
-                        # occasionally leaking scratchpad-style text like
-                        # "User hasn't responded yet" into the reply).
-                        if result.risk_level == RiskLevel.CONFIRMATION_REQUIRED:
-                            _pending_confirmations[session_id] = {
-                                "capability": cap_name,
-                                "arguments": cap_args,
-                            }
-                            logger.info(
-                                "Stored pending confirmation for session %s: %s %s",
-                                session_id, cap_name, cap_args,
-                            )
-
-                            # Phase 8: log this as "proposed" (not executed,
-                            # not failed) and record the attempt in working
-                            # context's recent_actions, without touching any
-                            # "current X" slot since nothing actually ran.
-                            working_context.update_from_result(cap_name, cap_args, result)
-                            action_log.record(
-                                cap_name, cap_args, result,
-                                session_id=session_id, status_override="proposed",
-                            )
-
-                            step_logs.append(
-                                AgentStepLog(
-                                    step_number=step,
-                                    capability=cap_name,
-                                    arguments=cap_args,
-                                    result=result,
-                                )
-                            )
-
-                            confirmation_question = self._describe_confirmation_request(
-                                cap_name, cap_args
-                            )
-                            emit("agent_completed", {"response": confirmation_question})
-                            return confirmation_question, step_logs
-
-                    # Phase 8: reflect this call in working context and the
-                    # global action log. Runs for every non-confirmation-
-                    # required outcome above (both success and failure).
+                    # Phase 8: reflect this confirmed action in working context
+                    # and the global action log, same as any other execution.
                     working_context.update_from_result(cap_name, cap_args, result)
                     action_log.record(cap_name, cap_args, result, session_id=session_id)
 
-                    step_logs.append(
-                        AgentStepLog(
-                            step_number=step,
-                            capability=cap_name,
-                            arguments=cap_args,
-                            result=result,
-                        )
+                    final_text = self._describe_confirmed_result(cap_name, cap_args, result)
+                    step_log = AgentStepLog(
+                        step_number=1, capability=cap_name, arguments=cap_args, result=result
+                    )
+                    emit("agent_completed", {"response": final_text})
+                    return final_text, [step_log]
+
+                if _NEGATIVE_PATTERN.match(normalized_message):
+                    _pending_confirmations.pop(session_id, None)
+
+                    # Phase 8: record that the user declined, so the action
+                    # feed shows this was proposed and then cancelled rather
+                    # than just silently vanishing.
+                    action_log.record(
+                        pending["capability"],
+                        pending["arguments"],
+                        result=None,
+                        session_id=session_id,
+                        status_override="cancelled",
                     )
 
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": cap_name,
-                            "content": result.model_dump_json(),
-                        }
-                    )
+                    final_text = "Okay, I won't do that. Let me know if you'd like something else."
+                    emit("agent_completed", {"response": final_text})
+                    return final_text, [AgentStepLog(step_number=1, note="confirmation_declined")]
 
-                # Continue the loop so Groq can see the tool results and
-                # decide the next action or produce a final answer.
-                continue
+                # Not a recognizable yes/no — drop the stale pending
+                # confirmation and fall through to handle this as a normal,
+                # unrelated new message.
+                _pending_confirmations.pop(session_id, None)
 
-            # No tool calls: the tool-routing model decided it's done.
-            # Make one dedicated call with the higher-quality model,
-            # explicitly declaring the tools but forcing tool_choice="none"
-            # so the model is not confused by prior tool_call history in
-            # the conversation and reliably produces plain text.
-            try:
-                final_response = self.groq_client.chat(
+            messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+            # Phase 8: inject a short working-context summary, but only if
+            # there's actually something worth mentioning (keeps brand-new
+            # sessions free of empty boilerplate).
+            context_summary = working_context.as_prompt_context()
+            if context_summary:
+                messages.append({"role": "system", "content": context_summary})
+
+            if history:
+                messages.extend(history)
+            messages.append({"role": "user", "content": user_message})
+
+            tools = self.registry.to_groq_tools()
+            step_logs: list[AgentStepLog] = []
+
+            emit("agent_started", {"message": user_message})
+
+            for step in range(1, self.max_steps + 1):
+                emit("agent_thinking", {"step": step})
+
+                # Tool-routing step: use the smaller/faster model since this
+                # is just deciding which capability (if any) to call next.
+                response = self.groq_client.chat(
                     messages=messages,
-                    model=self.groq_client.model,
-                    # Deliberately omit `tools` here. Passing tool_choice="none" was
-                    # meant to forbid tool calls on this final step, but gpt-oss-120b
-                    # on Groq doesn't reliably respect that constraint — it can still
-                    # emit a tool call, which Groq then rejects with a 400
-                    # "Tool choice is none, but model called a tool" error. Not
-                    # sending any tool definitions at all removes the possibility
-                    # entirely: with nothing to call, the model can only answer in
-                    # plain text.
+                    tools=tools or None,
+                    model=self.groq_client.tool_model,
                 )
-                final_text = final_response.choices[0].message.content or ""
-            except Exception:
-                logger.exception("Final answer generation failed; falling back to a safe summary.")
-                final_text = (
-                    "I finished taking the actions above, but ran into an issue "
-                    "generating a summary. Let me know if you'd like more detail."
-                )
+                choice = response.choices[0].message
 
-            # False-completion guard: if no mutating capability actually
-            # succeeded during this turn, but the final answer claims
-            # something was written/added/created, the claim is almost
-            # certainly a hallucination (usually caused by the tool-
-            # routing model misreading an ambiguous instruction as
-            # narration about something already done, and skipping the
-            # tool call entirely). Replace it with an honest offer to do
-            # it now instead of letting a false claim reach the user.
-            executed_mutation_this_turn = any(
-                log.capability in _MUTATING_CAPABILITIES
-                and log.result is not None
-                and log.result.success
-                for log in step_logs
+                # Groq wants to call one or more tools.
+                if getattr(choice, "tool_calls", None):
+                    messages.append(choice)
+
+                    for tool_call in choice.tool_calls:
+                        cap_name = tool_call.function.name
+                        try:
+                            cap_args = json.loads(tool_call.function.arguments or "{}")
+                        except json.JSONDecodeError:
+                            cap_args = {}
+
+                        emit(
+                            "capability_started",
+                            {"capability": cap_name, "arguments": cap_args},
+                        )
+
+                        # Guard against the model hallucinating a literal,
+                        # unresolved placeholder (e.g. "<username>") inside an
+                        # argument such as a filesystem path. Executing that
+                        # directly produces a cryptic OSError deep in the
+                        # Executor; catching it here gives a clear, actionable
+                        # error instead and avoids ever hitting the filesystem.
+                        placeholder = _find_placeholder(cap_args)
+                        if placeholder:
+                            result = CapabilityResult(
+                                success=False,
+                                action=cap_name,
+                                error=(
+                                    f"Argument contains an unresolved placeholder "
+                                    f"'{placeholder}'. Use '~' for the home "
+                                    f"directory, or the exact path from a previous "
+                                    f"tool result, instead of a template value."
+                                ),
+                            )
+                            logger.warning(
+                                "Blocked tool call %s for session %s: placeholder "
+                                "%s found in arguments %s",
+                                cap_name, session_id, placeholder, cap_args,
+                            )
+                        else:
+                            result = self.executor.execute(cap_name, cap_args)
+
+                        if result.success:
+                            emit(
+                                "capability_completed",
+                                {"capability": cap_name, "data": result.data},
+                            )
+                        else:
+                            emit(
+                                "capability_failed",
+                                {"capability": cap_name, "error": result.error},
+                            )
+
+                            # If this failure is specifically because the
+                            # action needs user confirmation, stop the loop
+                            # here and now. We store the pending confirmation
+                            # for this session and return a deterministic,
+                            # code-generated question immediately — we do NOT
+                            # let the model see this tool result and try to
+                            # phrase its own question. That extra model
+                            # round-trip was the source of garbled/duplicated
+                            # confirmation text (the model sometimes needed
+                            # 2-4 more steps to "settle" on a final answer,
+                            # occasionally leaking scratchpad-style text like
+                            # "User hasn't responded yet" into the reply).
+                            if result.risk_level == RiskLevel.CONFIRMATION_REQUIRED:
+                                _pending_confirmations[session_id] = {
+                                    "capability": cap_name,
+                                    "arguments": cap_args,
+                                }
+                                logger.info(
+                                    "Stored pending confirmation for session %s: %s %s",
+                                    session_id, cap_name, cap_args,
+                                )
+
+                                # Phase 8: log this as "proposed" (not executed,
+                                # not failed) and record the attempt in working
+                                # context's recent_actions, without touching any
+                                # "current X" slot since nothing actually ran.
+                                working_context.update_from_result(cap_name, cap_args, result)
+                                action_log.record(
+                                    cap_name, cap_args, result,
+                                    session_id=session_id, status_override="proposed",
+                                )
+
+                                step_logs.append(
+                                    AgentStepLog(
+                                        step_number=step,
+                                        capability=cap_name,
+                                        arguments=cap_args,
+                                        result=result,
+                                    )
+                                )
+
+                                confirmation_question = self._describe_confirmation_request(
+                                    cap_name, cap_args
+                                )
+                                emit("agent_completed", {"response": confirmation_question})
+                                return confirmation_question, step_logs
+
+                        # Phase 8: reflect this call in working context and the
+                        # global action log. Runs for every non-confirmation-
+                        # required outcome above (both success and failure).
+                        working_context.update_from_result(cap_name, cap_args, result)
+                        action_log.record(cap_name, cap_args, result, session_id=session_id)
+
+                        step_logs.append(
+                            AgentStepLog(
+                                step_number=step,
+                                capability=cap_name,
+                                arguments=cap_args,
+                                result=result,
+                            )
+                        )
+
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "name": cap_name,
+                                "content": result.model_dump_json(),
+                            }
+                        )
+
+                    # Continue the loop so Groq can see the tool results and
+                    # decide the next action or produce a final answer.
+                    continue
+
+                # No tool calls: the tool-routing model decided it's done.
+                # Make one dedicated call with the higher-quality model,
+                # explicitly declaring the tools but forcing tool_choice="none"
+                # so the model is not confused by prior tool_call history in
+                # the conversation and reliably produces plain text.
+                try:
+                    final_response = self.groq_client.chat(
+                        messages=messages,
+                        model=self.groq_client.model,
+                        # Deliberately omit `tools` here. Passing tool_choice="none" was
+                        # meant to forbid tool calls on this final step, but gpt-oss-120b
+                        # on Groq doesn't reliably respect that constraint — it can still
+                        # emit a tool call, which Groq then rejects with a 400
+                        # "Tool choice is none, but model called a tool" error. Not
+                        # sending any tool definitions at all removes the possibility
+                        # entirely: with nothing to call, the model can only answer in
+                        # plain text.
+                    )
+                    final_text = final_response.choices[0].message.content or ""
+                except Exception:
+                    logger.exception("Final answer generation failed; falling back to a safe summary.")
+                    final_text = (
+                        "I finished taking the actions above, but ran into an issue "
+                        "generating a summary. Let me know if you'd like more detail."
+                    )
+
+                # False-completion guard: if no mutating capability actually
+                # succeeded during this turn, but the final answer claims
+                # something was written/added/created, the claim is almost
+                # certainly a hallucination (usually caused by the tool-
+                # routing model misreading an ambiguous instruction as
+                # narration about something already done, and skipping the
+                # tool call entirely). Replace it with an honest offer to do
+                # it now instead of letting a false claim reach the user.
+                executed_mutation_this_turn = any(
+                    log.capability in _MUTATING_CAPABILITIES
+                    and log.result is not None
+                    and log.result.success
+                    for log in step_logs
+                )
+                if not executed_mutation_this_turn and any(
+                    phrase in final_text.lower() for phrase in _FALSE_COMPLETION_PHRASES
+                ):
+                    logger.warning(
+                        "Suppressed a likely false-completion claim in final answer "
+                        "for session %s (no mutating capability succeeded this turn): %r",
+                        session_id, final_text,
+                    )
+                    final_text = (
+                        "I haven't actually done that yet — no file was written or "
+                        "created in this step. Want me to go ahead and do it now?"
+                    )
+
+                step_logs.append(
+                    AgentStepLog(step_number=step, note="final_answer")
+                )
+                emit("agent_completed", {"response": final_text})
+                return final_text, step_logs
+
+            # Loop exhausted without a final answer.
+            logger.warning("Agent reached MAX_AGENT_STEPS (%s) without finishing.", self.max_steps)
+            emit("agent_error", {"error": "max_steps_reached"})
+            fallback = (
+                "I've hit my step limit working on this. Here's where things stand — "
+                "let me know if you'd like me to continue."
             )
-            if not executed_mutation_this_turn and any(
-                phrase in final_text.lower() for phrase in _FALSE_COMPLETION_PHRASES
-            ):
-                logger.warning(
-                    "Suppressed a likely false-completion claim in final answer "
-                    "for session %s (no mutating capability succeeded this turn): %r",
-                    session_id, final_text,
-                )
-                final_text = (
-                    "I haven't actually done that yet — no file was written or "
-                    "created in this step. Want me to go ahead and do it now?"
-                )
-
-            step_logs.append(
-                AgentStepLog(step_number=step, note="final_answer")
-            )
-            emit("agent_completed", {"response": final_text})
-            return final_text, step_logs
-
-        # Loop exhausted without a final answer.
-        logger.warning("Agent reached MAX_AGENT_STEPS (%s) without finishing.", self.max_steps)
-        emit("agent_error", {"error": "max_steps_reached"})
-        fallback = (
-            "I've hit my step limit working on this. Here's where things stand — "
-            "let me know if you'd like me to continue."
-        )
-        return fallback, step_logs
+            return fallback, step_logs
+        finally:
+            set_voice_state(session_id, VoiceState.IDLE)

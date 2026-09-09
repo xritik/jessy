@@ -14,6 +14,10 @@ Handles:
     - A "main" model (higher quality, used for final answers) and a
       "tool" model (smaller/faster, used for tool-routing decisions),
       both configurable via environment variables.
+    - A Whisper transcription model (audio -> text), also sharing the
+      same key pool but tracked against its own, lower RPM budget
+      (Groq's free-tier Whisper limit is 20 RPM, well below the
+      default chat RPM limit).
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ from groq import Groq, RateLimitError, APIStatusError
 logger = logging.getLogger("jessy.groq_client")
 
 DEFAULT_RPM_LIMIT = 30            # Groq free-tier default, per model per org
+DEFAULT_AUDIO_RPM_LIMIT = 20      # Groq free-tier Whisper endpoint limit
 DEFAULT_COOLDOWN_SECONDS = 3600.0  # fallback cooldown if Retry-After is absent
 WINDOW_SECONDS = 60.0
 
@@ -94,7 +99,11 @@ class GroqClient:
         api_keys: Optional[list[str]] = None,
         model: Optional[str] = None,
         tool_model: Optional[str] = None,
+        whisper_model: Optional[str] = None,
+        tts_model: Optional[str] = None,          # <-- new
         rpm_limit: Optional[int] = None,
+        audio_rpm_limit: Optional[int] = None,
+        tts_rpm_limit: Optional[int] = None,       # <-- new
     ) -> None:
         keys = api_keys or self._load_keys_from_env()
         if not keys:
@@ -105,7 +114,16 @@ class GroqClient:
 
         self.model = model or os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
         self.tool_model = tool_model or os.getenv("GROQ_TOOL_MODEL", "openai/gpt-oss-20b")
+        self.whisper_model = whisper_model or os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo")
         self.rpm_limit = rpm_limit or int(os.getenv("GROQ_RPM_LIMIT", str(DEFAULT_RPM_LIMIT)))
+        self.audio_rpm_limit = audio_rpm_limit or int(
+            os.getenv("GROQ_AUDIO_RPM_LIMIT", str(DEFAULT_AUDIO_RPM_LIMIT))
+        )
+        self.tts_model = tts_model or os.getenv("GROQ_TTS_MODEL", "canopylabs/orpheus-v1-english")
+        self.tts_rpm_limit = tts_rpm_limit or int(
+            os.getenv("GROQ_TTS_RPM_LIMIT", str(DEFAULT_AUDIO_RPM_LIMIT))
+        )
+
 
         self._keys = [_KeyState(k) for k in keys]
         self._num_keys = len(self._keys)
@@ -113,12 +131,14 @@ class GroqClient:
         self._rr_lock = threading.Lock()
 
         logger.info(
-            "GroqClient initialized with model=%s, tool_model=%s, %s key(s) available "
-            "(rpm_limit=%s per key per model)",
+            "GroqClient initialized with model=%s, tool_model=%s, whisper_model=%s, "
+            "%s key(s) available (rpm_limit=%s, audio_rpm_limit=%s per key per model)",
             self.model,
             self.tool_model,
+            self.whisper_model,
             self._num_keys,
             self.rpm_limit,
+            self.audio_rpm_limit,
         )
 
     @staticmethod
@@ -148,7 +168,7 @@ class GroqClient:
             self._rr_index = (self._rr_index + 1) % self._num_keys
             return start
 
-    def _pick_key_order(self, model: str) -> list[int]:
+    def _pick_key_order(self, model: str, rpm_limit: Optional[int] = None) -> list[int]:
         """
         Order key indices to try: start from the next round-robin slot
         (spreading load evenly), prioritize keys with proactive RPM
@@ -157,11 +177,12 @@ class GroqClient:
         is still attempted rather than failing before hitting the
         network at all.
         """
+        limit = rpm_limit or self.rpm_limit
         now = time.monotonic()
         start = self._next_round_robin_start()
         ordered = [(start + i) % self._num_keys for i in range(self._num_keys)]
 
-        available = [i for i in ordered if self._keys[i].is_available(model, self.rpm_limit, now)]
+        available = [i for i in ordered if self._keys[i].is_available(model, limit, now)]
         unavailable = [i for i in ordered if i not in available]
         return available + unavailable
 
@@ -243,6 +264,145 @@ class GroqClient:
         raise RuntimeError(
             "All Groq API keys have hit their rate limit. Please try again later."
         ) from last_error
+
+    def transcribe(
+        self,
+        audio_bytes: bytes,
+        filename: str = "input.wav",
+        model: Optional[str] = None,
+        prompt: Optional[str] = None,
+        language: Optional[str] = None,
+        response_format: str = "json",
+        temperature: float = 0.0,
+        **kwargs: Any,
+    ) -> Any:
+        """
+        Send an audio transcription request to Groq's Whisper endpoint,
+        using the same proactive key rotation + reactive 429 handling
+        as `chat()`, but tracked against the (lower) audio RPM budget.
+        """
+        use_model = model or self.whisper_model
+        key_order = self._pick_key_order(use_model, rpm_limit=self.audio_rpm_limit)
+
+        last_error: Optional[Exception] = None
+
+        for position, key_index in enumerate(key_order):
+            key_state = self._keys[key_index]
+            now = time.monotonic()
+            is_last_option = position == len(key_order) - 1
+
+            if not key_state.is_available(use_model, self.audio_rpm_limit, now) and not is_last_option:
+                continue
+
+            logger.info(
+                "Using Groq key #%s (%s) for transcription [model=%s]",
+                key_index + 1,
+                key_state.masked,
+                use_model,
+            )
+
+            request_kwargs: dict[str, Any] = {
+                "model": use_model,
+                "file": (filename, audio_bytes),
+                "response_format": response_format,
+                "temperature": temperature,
+                **kwargs,
+            }
+            if prompt:
+                request_kwargs["prompt"] = prompt
+            if language:
+                request_kwargs["language"] = language
+
+            try:
+                response = key_state.client.audio.transcriptions.create(**request_kwargs)
+                key_state.record_call(use_model, time.monotonic())
+                return response
+
+            except RateLimitError as exc:
+                last_error = exc
+                cooldown_seconds = self._extract_retry_after(exc) or DEFAULT_COOLDOWN_SECONDS
+                key_state.set_cooldown(use_model, cooldown_seconds)
+                logger.warning(
+                    "Groq key #%s (%s) hit rate limit on transcription; cooling down for %ss",
+                    key_index + 1,
+                    key_state.masked,
+                    int(cooldown_seconds),
+                )
+                continue
+
+            except APIStatusError:
+                raise
+
+        raise RuntimeError(
+            "All Groq API keys have hit their rate limit for transcription. Please try again later."
+        ) from last_error
+
+
+    def speak(
+        self,
+        text: str,
+        voice: str = "austin",
+        model: Optional[str] = None,
+        response_format: str = "wav",
+        **kwargs: Any,
+    ) -> bytes:
+        """
+        Convert text to speech via Groq's Orpheus TTS endpoint, using
+        the same proactive key rotation + reactive 429 handling as
+        chat() and transcribe(). Returns raw audio bytes.
+        """
+        use_model = model or self.tts_model
+        key_order = self._pick_key_order(use_model, rpm_limit=self.tts_rpm_limit)
+
+        last_error: Optional[Exception] = None
+
+        for position, key_index in enumerate(key_order):
+            key_state = self._keys[key_index]
+            now = time.monotonic()
+            is_last_option = position == len(key_order) - 1
+
+            if not key_state.is_available(use_model, self.tts_rpm_limit, now) and not is_last_option:
+                continue
+
+            logger.info(
+                "Using Groq key #%s (%s) for TTS [model=%s]",
+                key_index + 1,
+                key_state.masked,
+                use_model,
+            )
+
+            request_kwargs: dict[str, Any] = {
+                "model": use_model,
+                "voice": voice,
+                "input": text,
+                "response_format": response_format,
+                **kwargs,
+            }
+
+            try:
+                response = key_state.client.audio.speech.create(**request_kwargs)
+                key_state.record_call(use_model, time.monotonic())
+                return response.read()
+
+            except RateLimitError as exc:
+                last_error = exc
+                cooldown_seconds = self._extract_retry_after(exc) or DEFAULT_COOLDOWN_SECONDS
+                key_state.set_cooldown(use_model, cooldown_seconds)
+                logger.warning(
+                    "Groq key #%s (%s) hit rate limit on TTS; cooling down for %ss",
+                    key_index + 1,
+                    key_state.masked,
+                    int(cooldown_seconds),
+                )
+                continue
+
+            except APIStatusError:
+                raise
+
+        raise RuntimeError(
+            "All Groq API keys have hit their rate limit for TTS. Please try again later."
+        ) from last_error
+
 
     @staticmethod
     def _extract_retry_after(exc: RateLimitError) -> Optional[float]:
