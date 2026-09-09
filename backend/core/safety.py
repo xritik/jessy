@@ -102,6 +102,10 @@ class SafetyLayer:
         "open_file_in_vscode": lambda args: RiskLevel.SAFE,
         "save_file_in_vscode": lambda args: RiskLevel.SAFE,
         "create_file_visual_in_vscode": lambda args: RiskLevel.SAFE,
+
+        # Desktop wallpaper - safe, immediate, non-destructive
+        "set_desktop_wallpaper": lambda args: RiskLevel.SAFE,
+
     }
 
     @staticmethod

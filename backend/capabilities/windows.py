@@ -51,6 +51,9 @@ _SW_MINIMIZE = 6
 _SW_MAXIMIZE = 3
 _VK_MENU = 0x12
 _KEYEVENTF_KEYUP = 0x0002
+_SPI_SETDESKWALLPAPER = 0x0014
+_SPIF_UPDATEINIFILE = 0x01
+_SPIF_SENDCHANGE = 0x02
 
 _EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
@@ -386,6 +389,47 @@ def get_screen_size() -> CapabilityResult:
     height = _user32.GetSystemMetrics(1)
     return CapabilityResult.ok("get_screen_size", {"width": width, "height": height})
 
+def set_desktop_wallpaper(path: str) -> CapabilityResult:
+    """Set the Windows desktop background/wallpaper to the given image file.
+
+    Uses SystemParametersInfoW directly (SPI_SETDESKWALLPAPER), which is
+    the real, immediate, user-visible way to change the wallpaper on
+    Windows — no shell command or file write involved.
+    """
+    resolved = _resolve_target_path(path)
+
+    if not os.path.isfile(resolved):
+        return CapabilityResult.fail(
+            "set_desktop_wallpaper", f"Image file not found: {resolved}"
+        )
+
+    valid_ext = {".bmp", ".jpg", ".jpeg", ".png"}
+    if os.path.splitext(resolved)[1].lower() not in valid_ext:
+        return CapabilityResult.fail(
+            "set_desktop_wallpaper",
+            f"Unsupported image type for wallpaper: {resolved}",
+        )
+
+    try:
+        ok = _user32.SystemParametersInfoW(
+            _SPI_SETDESKWALLPAPER,
+            0,
+            resolved,
+            _SPIF_UPDATEINIFILE | _SPIF_SENDCHANGE,
+        )
+    except OSError as exc:
+        return CapabilityResult.fail(
+            "set_desktop_wallpaper", f"Failed to set wallpaper: {exc}"
+        )
+
+    if not ok:
+        return CapabilityResult.fail(
+            "set_desktop_wallpaper", "SystemParametersInfoW call failed."
+        )
+
+    return CapabilityResult.ok("set_desktop_wallpaper", {"wallpaper": resolved})
+
+
 registry.register(
     name="open_application",
     function=open_application,
@@ -481,5 +525,30 @@ registry.register(
     name="get_screen_size", function=get_screen_size,
     description="Get the primary monitor's resolution in pixels.",
     parameters={"type": "object", "properties": {}, "required": []},
+    risk="safe",
+)
+registry.register(
+    name="set_desktop_wallpaper",
+    function=set_desktop_wallpaper,
+    description=(
+        "Set/change the Windows desktop background (wallpaper) to a "
+        "specific image file. Pass the full resolved absolute path to the "
+        "image — e.g. after listing files in a folder and picking the "
+        "1st/5th/etc one by sorted order. This directly applies the "
+        "wallpaper immediately. Always use this capability for any "
+        "request to change or set the desktop background/wallpaper — "
+        "do NOT use open_application, run_command, execute_command, or "
+        "write_file for this task."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Absolute path to the image file to set as wallpaper.",
+            },
+        },
+        "required": ["path"],
+    },
     risk="safe",
 )
