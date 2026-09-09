@@ -1,26 +1,16 @@
 """
-Voice State — Phase 9.4
+Voice State — Phase 9.4 / Phase 10
 
-Tracks a simple per-session voice state machine so that later (Phase
-10's WebSocket layer) the GUI can show accurate real-time status
-("JESSY is listening...", "JESSY is thinking...", "JESSY is
-speaking...") instead of guessing from HTTP request/response timing.
+Tracks a simple per-session voice state machine so the GUI can show
+accurate real-time status ("JESSY is listening...", "JESSY is
+thinking...", "JESSY is speaking...") instead of guessing from HTTP
+request/response timing.
 
-Phase 9's /voice endpoint is still a single request/response round
-trip (a full audio clip uploaded, a full response returned) — this
-module does not drive live audio capture. What it tracks is *logical*
-pipeline state, updated by agent/agent.py and main.py at the right
-points during that round trip:
-
-    idle -> listening (STT running) -> thinking (Agent loop running)
-         -> speaking (TTS running) -> idle
-
-Right now the only way to observe a transition is the debug endpoint
-below or the server log line each transition emits, since a single
-HTTP request completes before you could poll it mid-flight. That's
-expected for this phase — Phase 10's WebSocket will push these same
-transitions to the GUI live, as they happen, instead of after the
-fact.
+Phase 10 update: every transition now also pushes a "voice_state"
+WebSocket event to any GUI connected for this session_id, via
+ws/manager.py. This works even though set_state() itself stays a
+plain synchronous function — ws/manager.emit_from_thread() is safe to
+call from any thread and simply no-ops if nobody is connected.
 
 Process model note: identical caveat to agent/context.py and
 agent/agent.py's _pending_confirmations — a plain in-memory dict at
@@ -36,6 +26,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
+
+from ws.manager import manager
 
 logger = logging.getLogger("jessy.voice.state")
 
@@ -72,7 +64,8 @@ _lock = threading.Lock()
 
 
 def set_state(session_id: str, state: VoiceState) -> None:
-    """Set (or create) the voice state for a session."""
+    """Set (or create) the voice state for a session, and push a live
+    "voice_state" WebSocket event if the state actually changed."""
     with _lock:
         previous = _states.get(session_id)
         _states[session_id] = VoiceStatus(
@@ -83,6 +76,7 @@ def set_state(session_id: str, state: VoiceState) -> None:
             "Voice state for session %s: %s -> %s",
             session_id, previous.state.value if previous else "unknown", state.value,
         )
+        manager.emit_from_thread(session_id, "voice_state", {"state": state.value})
 
 
 def get_state(session_id: str) -> VoiceStatus:
