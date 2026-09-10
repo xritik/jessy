@@ -1,0 +1,25 @@
+:root {
+  /* Core palette */
+  --bg: #020408;
+  --grid: rgba(0, 234, 255, 0.025);
+
+  --cyan: #00eaff;
+  --pink: #ff2ecb;
+  --amber: #ffb100;
+  --green: #35e08c;
+  --red: #ff4d4d;
+
+  --panel: rgba(4, 10, 20, 0.85);
+  --border: rgba(0, 234, 255, 0.14);
+  --border-soft: rgba(0, 234, 255, 0.10);
+
+  --text: #d7ecf5;
+  --text-dim: #6c8a9c;
+
+  --font-ui: "Segoe UI", -apple-system, sans-serif;
+  --font-mono: "Consolas", "SFMono-Regular", monospace;
+
+  --sidebar-w: 195px;
+  --topbar-h: 36px;
+  --footer-h: 44px;
+}

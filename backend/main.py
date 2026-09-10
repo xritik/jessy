@@ -38,6 +38,7 @@ import asyncio
 import base64
 import logging
 import os
+import time
 
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -83,6 +84,7 @@ from voice.state import (  # noqa: E402
     set_state as set_voice_state,
 )
 from ws.manager import manager  # noqa: E402
+from app.history_store import init_db, record_action, get_actions as get_history_actions, list_conversations, get_conversation, check_db_health
 
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
 
@@ -91,6 +93,7 @@ app = FastAPI(
     description="AI Personal Computer Agent — Backend API",
     version="0.4.0",
 )
+START_TIME = time.time()
 
 app.add_middleware(
     CORSMiddleware,
@@ -227,7 +230,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
 
 
 @app.get("/actions", tags=["agent"])
-async def get_actions(limit: int = 10):
+async def recent_actions(limit: int = 10):
     """
     Return the most recent capability actions across all sessions, for
     the future Action Feed (Phase 11). Statuses: executed / proposed /
@@ -326,22 +329,27 @@ def _run_agent_turn(
 
 @app.post("/chat", response_model=ChatResponse, tags=["agent"])
 async def chat(request: ChatRequest):
-    """
-    Send a message to the JESSY agent and get back its final response
-    after it has run its full tool-calling loop. If a GUI is connected
-    to GET /ws/{session_id} for this session, it will see every
-    intermediate step live while this request is in flight.
-    """
     session_id = request.session_id or "default"
+
+    record_action(session_id=session_id, type="chat_received", detail=request.message)
 
     def on_event(event_type: str, payload: dict[str, Any]) -> None:
         manager.emit_from_thread(session_id, event_type, payload)
+        record_action(
+            session_id=session_id,
+            type=event_type,
+            capability=payload.get("capability"),
+            detail=payload.get("detail") or payload.get("message"),
+            payload=payload,
+        )
 
     final_text, steps = await run_in_threadpool(
         _run_agent_turn, request.message, session_id, on_event
     )
-    return ChatResponse(response=final_text, steps=steps)
 
+    record_action(session_id=session_id, type="chat_response", detail=final_text)  # <-- new
+
+    return ChatResponse(response=final_text, steps=steps)
 
 def _handle_voice_sync(
     audio_bytes: bytes,
@@ -455,3 +463,64 @@ async def speak_text(text: str = Form(...), voice: str | None = Form(None)):
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error)
     return Response(content=result.audio_bytes, media_type=result.content_type)
+
+# Call once at startup (alongside any other startup init you already have):
+@app.on_event("startup")
+def _startup():
+    init_db()
+
+
+# --- Hook into your event emitter ---
+# Find the function in your capability-execution / WS-manager code that
+# currently does something like: `await websocket.send_json(event)` or
+# `manager.broadcast(session_id, event)`. Wrap every call site (or the
+# function itself, if it's centralized) with a matching record_action call:
+
+# Example, if you have a centralized emit function:
+async def emit_event(session_id: str, event: dict):
+    await ws_manager.broadcast(session_id, event)   # your existing line
+    record_action(                                   # <-- add this
+        session_id=session_id,
+        type=event.get("type", "unknown"),
+        capability=event.get("capability"),
+        detail=event.get("detail") or event.get("message"),
+        payload=event,
+    )
+
+
+# --- New endpoint ---
+from fastapi import Query
+
+@app.get("/history")
+def history(
+    session_id: str | None = Query(default=None),
+    type: str | None = Query(default=None),
+    limit: int = Query(default=50, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    return get_history_actions(session_id=session_id, type=type, limit=limit, offset=offset)
+    
+@app.get("/conversations", tags=["agent"])
+def conversations(
+    limit: int = Query(default=50, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    return list_conversations(limit=limit, offset=offset)
+
+
+@app.get("/conversations/{session_id}", tags=["agent"])
+def conversation_detail(session_id: str):
+    messages = get_conversation(session_id)
+    if not messages:
+        raise HTTPException(status_code=404, detail="No conversation found for this session.")
+    return {"session_id": session_id, "messages": messages}
+
+@app.get("/status", tags=["system"])
+def status():
+    db_ok = check_db_health()
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "database_ok": db_ok,
+        "uptime_seconds": round(time.time() - START_TIME, 1),
+        "server_time": time.time(),
+    }

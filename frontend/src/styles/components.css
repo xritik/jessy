@@ -1,0 +1,248 @@
+/* ---------- StarField ---------- */
+.starfield {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.starfield-static {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 1px;
+}
+
+.starfield-twinkle {
+  position: absolute;
+  width: 2px;
+  height: 2px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 0 4px 1px rgba(255, 255, 255, 0.75);
+  opacity: 0;
+  animation-name: twinkle;
+  animation-iteration-count: infinite;
+  animation-timing-function: ease-in-out;
+}
+
+@keyframes twinkle {
+  0%,
+  100% {
+    opacity: 0;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+
+/* ---------- Sidebar ---------- */
+.sidebar {
+  position: relative;
+  z-index: 2;
+  width: var(--sidebar-w);
+  min-width: var(--sidebar-w);
+  height: 100vh;
+  background: var(--panel);
+  border-right: 1px solid var(--border-soft);
+  display: flex;
+  flex-direction: column;
+  backdrop-filter: blur(6px);
+}
+
+.sidebar-brand {
+  padding: 20px 18px 16px;
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.brand-title {
+  font-family: var(--font-mono);
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 3px;
+  color: var(--cyan);
+  text-shadow: 0 0 12px rgba(0, 234, 255, 0.55);
+}
+
+.brand-sub {
+  font-size: 10px;
+  letter-spacing: 2px;
+  color: var(--text-dim);
+  margin-top: 3px;
+}
+
+.sidebar-nav {
+  display: flex;
+  flex-direction: column;
+  padding: 10px 8px;
+  gap: 2px;
+  overflow-y: auto;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  color: var(--text);
+  font-size: 12.5px;
+  text-align: left;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.nav-item:not(.nav-item-disabled):hover {
+  background: rgba(0, 234, 255, 0.06);
+}
+
+.nav-item-active {
+  background: rgba(0, 234, 255, 0.12);
+  border-color: var(--border);
+  color: var(--cyan);
+}
+
+.nav-item-disabled {
+  color: var(--text-dim);
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.nav-icon {
+  width: 16px;
+  text-align: center;
+  font-size: 13px;
+}
+
+.nav-label {
+  flex: 1;
+}
+
+.nav-badge {
+  background: var(--cyan);
+  color: #02141a;
+  font-size: 10px;
+  font-weight: 700;
+  border-radius: 10px;
+  padding: 1px 6px;
+  min-width: 16px;
+  text-align: center;
+}
+
+.nav-note {
+  font-size: 9px;
+  color: var(--text-dim);
+  letter-spacing: 1px;
+}
+
+.sidebar-bottom {
+  flex: 1; /* intentionally empty per spec */
+}
+
+/* ---------- Topbar ---------- */
+.topbar {
+  height: var(--topbar-h);
+  min-height: var(--topbar-h);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--border-soft);
+  background: rgba(4, 10, 20, 0.6);
+}
+
+.topbar-left,
+.topbar-center,
+.topbar-right {
+  display: flex;
+  align-items: center;
+}
+
+.topbar-center {
+  gap: 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.topbar-clock {
+  color: var(--cyan);
+  font-weight: 600;
+  letter-spacing: 1px;
+}
+
+.status-pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  letter-spacing: 1.5px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+}
+
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  animation: blink 1.4s ease-in-out infinite;
+}
+
+@keyframes blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
+}
+
+.status-optimal {
+  color: var(--cyan);
+}
+.status-optimal .status-dot {
+  background: var(--cyan);
+  box-shadow: 0 0 6px var(--cyan);
+}
+
+.status-degraded {
+  color: #ff6b6b;
+}
+.status-degraded .status-dot {
+  background: #ff6b6b;
+  box-shadow: 0 0 6px #ff6b6b;
+}
+
+.status-connecting {
+  color: var(--amber);
+}
+.status-connecting .status-dot {
+  background: var(--amber);
+  box-shadow: 0 0 6px var(--amber);
+}
+
+.topbar-search {
+  background: rgba(0, 234, 255, 0.05);
+  border: 1px solid var(--border-soft);
+  border-radius: 5px;
+  color: var(--text);
+  font-size: 12px;
+  padding: 5px 10px;
+  width: 180px;
+  outline: none;
+}
+
+.topbar-search:focus {
+  border-color: var(--border);
+}
+
+.topbar-search::placeholder {
+  color: var(--text-dim);
+}

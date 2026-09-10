@@ -1,52 +1,73 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
+import StarField from "./components/StarField";
+import Sidebar from "./components/Sidebar";
+import Topbar from "./components/Topbar";
+import Dashboard from "./components/Dashboard";
+import ActionHistoryPage from "./pages/ActionHistoryPage";
+import ConversationsPage from "./pages/ConversationsPage";
+import StatusPage from "./pages/statusPage";
+import { useBadgeCounts } from "./hooks/useBadgeCounts";
+import "./styles/variables.css";
+import "./styles/global.css";
+import "./styles/components.css";
+import "./styles/dashboard.css";
+import "./styles/history.css";
+import "./styles/conversations.css";
+import "./styles/status.css";
 
-const BACKEND_URL = "http://localhost:8000";
+const VIEW_LABELS = {
+  chat: "CONVERSATIONS",
+  history: "ACTION HISTORY",
+};
 
-/**
- * Step 1 App Shell.
- *
- * This is NOT the final Solar System Command Center GUI — that is
- * built in Phase 11. This shell exists only to prove that the
- * frontend can reach the real backend, using the brand colors
- * and identity that the final GUI will be built on top of.
- */
-function App() {
-  const [status, setStatus] = useState("CONNECTING");
-  const [timestamp, setTimestamp] = useState(null);
+function makeSessionId() {
+  return typeof crypto !== "undefined" && crypto.randomUUID
+    ? crypto.randomUUID()
+    : `session-${Date.now()}`;
+}
 
-  useEffect(() => {
-    const checkHealth = async () => {
-      try {
-        const res = await fetch(`${BACKEND_URL}/health`);
-        if (!res.ok) throw new Error("Bad response");
-        const data = await res.json();
-        setStatus(data.status === "online" ? "OPTIMAL" : "DEGRADED");
-        setTimestamp(data.timestamp);
-      } catch (err) {
-        setStatus("DEGRADED");
-      }
-    };
-
-    checkHealth();
-    const interval = setInterval(checkHealth, 5000);
-    return () => clearInterval(interval);
-  }, []);
+export default function App() {
+  const [activeView, setActiveView] = useState("dashboard");
+  const [searchTerm, setSearchTerm] = useState("");
+  const [sessionId, setSessionId] = useState(makeSessionId);
+  const { conversationCount, actionCount } = useBadgeCounts();
 
   return (
-    <div className="jessy-shell">
-      <h1 className="jessy-title">JESSY</h1>
-      <p className="jessy-subtitle">AI CORE · v0.1 (Foundation)</p>
+    <div className="app-shell">
+      <StarField />
+      <div className="grid-overlay" aria-hidden="true" />
 
-      <div className={`status-pill status-${status.toLowerCase()}`}>
-        <span className="status-dot" />
-        {status}
+      <Sidebar
+        activeView={activeView}
+        onNavigate={setActiveView}
+        conversationCount={conversationCount}
+        actionCount={actionCount}
+      />
+
+      <div className="app-main">
+        <Topbar onSearch={setSearchTerm} />
+
+        <main className="app-content">
+          {activeView === "dashboard" ? (
+            <Dashboard sessionId={sessionId} />
+          ) : activeView === "chat" ? (
+            <ConversationsPage
+              onResumeSession={(id) => {
+                setSessionId(id);
+                setActiveView("dashboard");
+              }}
+            />
+          ) : activeView === "history" ? (
+            <ActionHistoryPage sessionId={sessionId} />
+          ) : activeView === "status" ? (
+            <StatusPage sessionId={sessionId} />
+          ) : (
+            <div className="view-placeholder">
+              <span>[ {VIEW_LABELS[activeView] ?? activeView.toUpperCase()} VIEW — under construction ]</span>
+            </div>
+          )}
+        </main>
       </div>
-
-      {timestamp && (
-        <p className="jessy-timestamp">Backend last responded: {timestamp}</p>
-      )}
     </div>
   );
 }
-
-export default App;
