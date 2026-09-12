@@ -40,8 +40,10 @@
 
 /* ---------- Sidebar ---------- */
 .sidebar {
-  position: relative;
-  z-index: 2;
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 1000;
   width: var(--sidebar-w);
   min-width: var(--sidebar-w);
   height: 100vh;
@@ -246,3 +248,28 @@
 .topbar-search::placeholder {
   color: var(--text-dim);
 }
+
+
+.sidebar-hidden { transform: translateX(calc(-1 * var(--sidebar-w) - 8px)); pointer-events: none; }
+.sidebar-open { transform: translateX(0); box-shadow: 20px 0 50px rgba(0,0,0,.28); }
+.sidebar { transition: transform .24s ease, box-shadow .24s ease; }
+.sidebar-toggle { position: fixed; left: 9px; top: 50%; transform: translateY(-50%); z-index: 1100; width: 25px; height: 58px; border: 1px solid rgba(0,234,255,.22); border-radius: 7px; background: rgba(3,13,24,.88); color: var(--cyan); font: 700 23px var(--font-mono); box-shadow: 0 0 18px rgba(0,234,255,.08); backdrop-filter: blur(8px); transition: left .24s ease, background .2s ease; }
+.sidebar-toggle:hover { background: rgba(0,234,255,.1); }
+.sidebar-toggle.is-open { left: calc(var(--sidebar-w) - 17px); }
+
+.device-status { display:flex; align-items:center; gap:7px; color:#9fc0ca; font:700 9px var(--font-mono); letter-spacing:.8px; padding:4px 7px; border-left:1px solid rgba(0,234,255,.08); }
+.device-status small { color:var(--green); font-size:7px; }
+.device-unavailable { color:#536f7c; }
+.battery-icon { position:relative; display:inline-flex; align-items:center; height:14px; }
+.battery-shell { width:22px; height:11px; border:1px solid currentColor; border-radius:2px; padding:1px; display:block; }
+.battery-fill { display:block; height:100%; background:currentColor; border-radius:1px; box-shadow:0 0 6px currentColor; transition:width .25s ease; }
+.battery-tip { width:2px; height:5px; margin-left:1px; background:currentColor; border-radius:0 1px 1px 0; }
+.battery-bolt { position:absolute; left:6px; top:-4px; font-size:8px; color:#ffe16a; text-shadow:0 0 8px #ffb100; }
+.wifi-icon { position:relative; width:19px; height:16px; display:inline-block; }
+.wifi-arc { position:absolute; left:50%; border:1.5px solid currentColor; border-bottom:0; border-left-color:transparent; border-right-color:transparent; border-radius:50% 50% 0 0; transform:translateX(-50%); }
+.wifi-arc-1 { width:18px; height:12px; top:0; } .wifi-arc-2 { width:12px; height:8px; top:4px; } .wifi-arc-3 { width:6px; height:4px; top:8px; }
+.wifi-dot { position:absolute; width:3px; height:3px; left:50%; bottom:1px; transform:translateX(-50%); background:currentColor; border-radius:50%; }
+.wifi-icon.connected { color:var(--cyan); filter:drop-shadow(0 0 4px rgba(0,234,255,.5)); }
+.wifi-icon.disconnected { color:var(--red); filter:drop-shadow(0 0 5px rgba(255,77,77,.55)); }
+.wifi-label { color:var(--cyan); } .wifi-label.wifi-off { color:var(--red); }
+@media (max-width:650px){ .device-status small{display:none}.topbar-center{display:none}.sidebar-toggle{left:5px}.sidebar-toggle.is-open{left:calc(var(--sidebar-w) - 17px)} }

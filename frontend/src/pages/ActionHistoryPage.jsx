@@ -37,7 +37,6 @@ export default function ActionHistoryPage({ sessionId }) {
         limit: PAGE_SIZE,
         offset: nextOffset,
       });
-      setItems(nextOffset === 0 ? data.items : (prev) => [...prev, ...data.items]);
       if (nextOffset === 0) setItems(data.items);
       else setItems((prev) => [...prev, ...data.items]);
       setTotal(data.total);

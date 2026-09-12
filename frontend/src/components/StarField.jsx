@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 
-const STATIC_STAR_COUNT = 140;
-const TWINKLE_STAR_COUNT = 18;
+const STATIC_STAR_COUNT = 220;
+const TWINKLE_STAR_COUNT = 48;
 
 function buildStaticShadow(count) {
   const shadows = [];

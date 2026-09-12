@@ -28,7 +28,7 @@ function makeSessionId() {
 
 export default function App() {
   const [activeView, setActiveView] = useState("dashboard");
-  const [searchTerm, setSearchTerm] = useState("");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sessionId, setSessionId] = useState(makeSessionId);
   const { conversationCount, actionCount } = useBadgeCounts();
 
@@ -38,18 +38,20 @@ export default function App() {
       <div className="grid-overlay" aria-hidden="true" />
 
       <Sidebar
+        open={sidebarOpen}
+        onToggle={() => setSidebarOpen((prev) => !prev)}
         activeView={activeView}
         onNavigate={setActiveView}
         conversationCount={conversationCount}
         actionCount={actionCount}
       />
 
-      <div className="app-main">
-        <Topbar onSearch={setSearchTerm} />
+      <div className={`app-main ${sidebarOpen ? "with-sidebar" : "sidebar-collapsed"}`}>
+        <Topbar />
 
         <main className="app-content">
           {activeView === "dashboard" ? (
-            <Dashboard sessionId={sessionId} />
+            <Dashboard sessionId={sessionId} onNavigate={setActiveView} />
           ) : activeView === "chat" ? (
             <ConversationsPage
               onResumeSession={(id) => {
