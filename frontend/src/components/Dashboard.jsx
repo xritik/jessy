@@ -347,7 +347,7 @@ export default function Dashboard({ sessionId, onNavigate }) {
           </div>
           <form className="command-dock" onSubmit={handleSubmit}>
             <button type="button" className={`dock-mic ${isListening ? "active" : ""}`} onClick={toggleMic} disabled={!micSupported || orbState === "thinking" || !isOnline} aria-label="Microphone">🎙️</button>
-            <input value={inputValue} onChange={(e) => setInputValue(e.target.value)} placeholder= {isOnline? "Speak or type a command for JARVIS..." : "Internet disconnected"} disabled={!isOnline || (orbState === "thinking")} />
+            <input value={inputValue} onChange={(e) => setInputValue(e.target.value)} autoFocus placeholder= {isOnline? "Speak or type a command for JARVIS..." : "Internet disconnected"} disabled={!isOnline || (orbState === "thinking")} />
             <button type="submit" className="dock-send" disabled={!inputValue.trim() || orbState === "thinking"} aria-label="Send">{orbState === "thinking" ? "···" : "➤"}</button>
             <button type="button" className={`dock-mute ${voiceEnabled ? "unmuted" : "muted"}`} onClick={toggleVoiceOutput} aria-label={voiceEnabled ? "Mute voice output" : "Unmute voice output"}>{voiceEnabled ? "🔊" : "🔇"}</button>
           </form>
