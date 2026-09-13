@@ -3,6 +3,7 @@ import react from "@vitejs/plugin-react";
 import os from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import basicSsl from '@vitejs/plugin-basic-ssl'
 
 const execFileAsync = promisify(execFile);
 
@@ -150,7 +151,12 @@ function hostTelemetryPlugin() {
   };
 }
 
-export default defineConfig({
-  plugins: [react(), hostTelemetryPlugin()],
-  server: { port: 5173 },
-});
+// export default defineConfig({
+//   plugins: [react(), hostTelemetryPlugin()],
+//   server: { host: true, port: 5173 },
+// });
+
+export default {
+  plugins: [basicSsl()],
+  server: { https: true, host: true,  port: 5173 },
+}

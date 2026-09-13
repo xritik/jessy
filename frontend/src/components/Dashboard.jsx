@@ -7,6 +7,7 @@ import { useTextToSpeech } from "../hooks/useTextToSpeech";
 
 const MAX_LOG_ENTRIES = 30;
 const CHAT_HISTORY_PAGE = 200;
+const wakeWord = (import.meta.env.VITE_WAKE_WORD || "hello jarvis").trim();
 
 function labelForEvent(evt) {
   switch (evt.type) {
@@ -150,10 +151,14 @@ export default function Dashboard({ sessionId, onNavigate }) {
     setVoiceTranscript(text);
     clearTimeout(responseTimer.current);
     responseTimer.current = setTimeout(() => setVoiceTranscript(""), 30000);
+    handleSubmit(null, text);
   }, []);
   const { isSupported: micSupported, isListening, interimText, error: micError, toggle: toggleMic } = useSpeechToText({
     lang: "en-US",
     onFinalResult: handleFinalTranscript,
+    wakeWord,
+    wakeWordEnabled: isOnline,
+    onWakeWord: () => {setError(null); setOrbDetail(""); setInputValue(""); toggleMic();},
   });
   const { isSupported: ttsSupported, speak, stop: stopSpeaking } = useTextToSpeech();
 
@@ -277,14 +282,14 @@ export default function Dashboard({ sessionId, onNavigate }) {
 
   useEffect(() => () => { clearTimeout(speakingTimer.current); clearTimeout(responseTimer.current); }, []);
 
-  async function handleSubmit(event) {
-    event.preventDefault();
+  async function handleSubmit(event, overrideMessage) {
+    event?.preventDefault?.();
     if (!isOnline) {
       setVoiceTranscript("Internet disconnected");
       setResponse("");
       return;
     }
-    const message = inputValue.trim();
+    const message = (overrideMessage ?? inputValue).trim();
     if (!message || orbState === "thinking") return;
     clearTimeout(speakingTimer.current); clearTimeout(responseTimer.current); stopSpeaking(); setError(null); setOrbDetail(""); setOrbState("thinking"); setInputValue(""); setVoiceTranscript(message);
     try {
