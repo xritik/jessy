@@ -44,6 +44,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from dotenv import load_dotenv
+load_dotenv()
 from fastapi import (
     FastAPI,
     File,
@@ -61,7 +62,6 @@ from starlette.concurrency import run_in_threadpool
 from core.memory import get_history, append_message
 from voice.tts import synthesize_speech  # noqa: E402
 
-load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,8 +86,12 @@ from voice.state import (  # noqa: E402
 from ws.manager import manager  # noqa: E402
 from app.history_store import init_db, record_action, get_actions as get_history_actions, list_conversations, get_conversation, check_db_health
 
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
-
+FRONTEND_ORIGIN = [
+    origin.strip()
+    for origin in os.getenv("FRONTEND_ORIGIN", "https://localhost:5173,https://10.89.73.150:5173").split(",")
+    if origin.strip()
+]
+print("CORS allowed origins:", FRONTEND_ORIGIN)
 app = FastAPI(
     title="JESSY Backend",
     description="AI Personal Computer Agent — Backend API",
@@ -97,7 +101,7 @@ START_TIME = time.time()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN],
+    allow_origins=FRONTEND_ORIGIN,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -524,3 +528,7 @@ def status():
         "uptime_seconds": round(time.time() - START_TIME, 1),
         "server_time": time.time(),
     }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
