@@ -125,6 +125,7 @@ export default function Dashboard({ sessionId, onNavigate }) {
   const [chatHistory, setChatHistory] = useState([]);
   const [historyError, setHistoryError] = useState(null);
   const [isOnline, setIsOnline] = useState(navigator.onLine);
+  const [desktopMode, setDesktopMode] = useState(false);
   const speakingTimer = useRef(null);
   const responseTimer = useRef(null);
   const previousOrbState = useRef("idle");
@@ -143,6 +144,16 @@ export default function Dashboard({ sessionId, onNavigate }) {
     } else if (evt.type === "capability_started") setOrbDetail(entry.label);
     else if (evt.type === "capability_finished" || evt.type === "agent_thinking") setOrbDetail("");
   }, []);
+
+  const DESKTOP_MODE_ON = [/desktop mode on/i, /activate desktop mode/i, /activate the desktop mode/i, /turn on desktop mode/i, /turn on the desktop mode/i, /enable desktop mode/i, /enable the desktop mode/i];
+  const DESKTOP_MODE_OFF = [/desktop mode off/i, /deactivate desktop mode/i, /deactivate the desktop mode/i, /turn off desktop mode/i, /turn off the desktop mode/i, /disable desktop mode/i, /disable the desktop mode/i];
+
+  function matchDesktopModeCommand(text) {
+    const t = text.trim().toLowerCase().replace(/^jarvis[,]?\s*/i, "");
+    if (DESKTOP_MODE_ON.some((p) => p.test(t))) return "on";
+    if (DESKTOP_MODE_OFF.some((p) => p.test(t))) return "off";
+    return null;
+  }
 
   useAgentSocket(sessionId, handleEvent);
   const handleFinalTranscript = useCallback((text) => {
@@ -291,6 +302,18 @@ export default function Dashboard({ sessionId, onNavigate }) {
     }
     const message = (overrideMessage ?? inputValue).trim();
     if (!message || orbState === "thinking") return;
+    const desktopCmd = matchDesktopModeCommand(message);
+    if (desktopCmd) {
+      setInputValue("");
+      const reply = desktopCmd === "on" ? "Desktop mode activated." : "Desktop mode deactivated.";
+      setDesktopMode(desktopCmd === "on");
+      setVoiceTranscript(message);
+      setResponse({ response: reply });
+      setOrbState("speaking");
+      if (voiceEnabled && ttsSupported) speak(reply, { onEnd: () => setOrbState("idle") });
+      else speakingTimer.current = setTimeout(() => setOrbState("idle"), 1600);
+      return;
+    }
     clearTimeout(speakingTimer.current); clearTimeout(responseTimer.current); stopSpeaking(); setError(null); setOrbDetail(""); setOrbState("thinking"); setInputValue(""); setVoiceTranscript(message);
     try {
       const data = await sendChat(message, sessionId);
@@ -307,7 +330,7 @@ export default function Dashboard({ sessionId, onNavigate }) {
   return (
     <div className="jarvis-dashboard">
       <div className="dashboard-grid">
-        <div className="left-stack">
+        <div className={`left-stack ${desktopMode ? "panels-visible" : "panels-hidden"}`}>
           <Panel title="SYSTEM OVERVIEW" right={status?.database_ok ? "LIVE" : "BACKEND"}>
             <div className="system-gauges">
               {metrics.map(([name, value, tone]) => <Gauge key={name} name={name} value={value} tone={tone} />)}
@@ -358,7 +381,7 @@ export default function Dashboard({ sessionId, onNavigate }) {
           </form>
         </section>
 
-        <div className="right-stack">
+        <div className={`right-stack ${desktopMode ? "panels-visible" : "panels-hidden"}`}>
           <Panel title="LIVE INTELLIGENCE FEED" right={<span className="live-text">● LIVE</span>}>
             <div className="feed-list">
               {log.slice(0, 5).map((e) => <div className="feed-row" key={e.id}><span className="feed-icon">◉</span><div><b>{e.label}</b><small>{e.time}</small></div></div>)}

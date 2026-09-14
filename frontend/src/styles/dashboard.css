@@ -212,6 +212,36 @@
   color: #d7f8ff
 }
 
+.left-stack,
+.right-stack {
+  transition: opacity 0.4s ease;
+}
+
+.panels-hidden {
+  pointer-events: none;
+}
+
+.panels-hidden .hud-panel {
+  opacity: 0;
+  transform: translateY(-16px) scale(0.98);
+  transition: opacity 0.4s ease, transform 0.4s ease;
+  pointer-events: none;
+}
+
+.panels-visible .hud-panel {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  transition: opacity 0.5s ease, transform 0.5s ease;
+}
+
+/* Stagger the reveal so cards animate in one after another */
+.panels-visible.left-stack .hud-panel:nth-child(1) { transition-delay: 0s; }
+.panels-visible.left-stack .hud-panel:nth-child(2) { transition-delay: 0.1s; }
+.panels-visible.left-stack .hud-panel:nth-child(3) { transition-delay: 0.2s; }
+.panels-visible.right-stack .hud-panel:nth-child(1) { transition-delay: 0.1s; }
+.panels-visible.right-stack .hud-panel:nth-child(2) { transition-delay: 0.2s; }
+.panels-visible.right-stack .hud-panel:nth-child(3) { transition-delay: 0.3s; }
+
 .core-stage {
   position: relative;
   min-width: 0;
