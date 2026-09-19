@@ -86,12 +86,6 @@ from voice.state import (  # noqa: E402
 from ws.manager import manager  # noqa: E402
 from app.history_store import init_db, record_action, get_actions as get_history_actions, list_conversations, get_conversation, check_db_health
 
-FRONTEND_ORIGIN = [
-    origin.strip()
-    for origin in os.getenv("FRONTEND_ORIGIN", "https://localhost:5173,https://10.89.73.150:5173").split(",")
-    if origin.strip()
-]
-print("CORS allowed origins:", FRONTEND_ORIGIN)
 app = FastAPI(
     title="JESSY Backend",
     description="AI Personal Computer Agent — Backend API",
@@ -101,7 +95,7 @@ START_TIME = time.time()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=FRONTEND_ORIGIN,
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+):5173$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
