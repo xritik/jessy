@@ -61,6 +61,9 @@ class SafetyLayer:
         "terminate_process": lambda args: RiskLevel.CONFIRMATION_REQUIRED,
         "end_process": lambda args: RiskLevel.CONFIRMATION_REQUIRED,  # alias
 
+        # Android phone - consequential communication
+        # "confirm_phone_call": lambda args: RiskLevel.CONFIRMATION_REQUIRED,
+
         # System - shutdown/restart (UNVERIFIED — confirm real registered name)
         "shutdown_system": lambda args: RiskLevel.BLOCKED,
         "restart_system": lambda args: RiskLevel.BLOCKED,
